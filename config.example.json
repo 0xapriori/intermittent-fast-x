@@ -58,8 +58,17 @@
   "output": {
     "briefs_dir": "~/twitter-digest/briefs",
     "latest_pointer": "~/twitter-digest/latest-brief.html",
-    "show_macos_notification": true
+    "show_macos_notification": true,
+    "telegram": {
+      "enabled": false,
+      "chat_id": "",
+      "keychain_service": "twitter-digest-telegram",
+      "key_tweets": 5
+    }
   },
+
+  "recent_briefs_for_dedup": 3,
+  "recent_briefs_hours": 48,
 
   "web_search_budget_hint": 10,
   "claude_cli_timeout_seconds": 1800,

@@ -108,6 +108,15 @@ WEB_SEARCH_BUDGET_HINT: int = CONFIG.get("web_search_budget_hint", 10)
 RECENT_BRIEFS_COUNT: int = CONFIG.get("recent_briefs_for_dedup", 3)
 RECENT_BRIEFS_HOURS: int = CONFIG.get("recent_briefs_hours", 48)
 
+# Telegram delivery (opt-in, config.output.telegram.enabled)
+_telegram_cfg = _output_cfg.get("telegram", {}) if isinstance(_output_cfg, dict) else {}
+TELEGRAM_ENABLED: bool = bool(_telegram_cfg.get("enabled", False))
+TELEGRAM_CHAT_ID: str = str(_telegram_cfg.get("chat_id", "") or "")
+TELEGRAM_KEYCHAIN_SERVICE: str = _telegram_cfg.get(
+    "keychain_service", "twitter-digest-telegram"
+)
+TELEGRAM_KEY_TWEETS: int = int(_telegram_cfg.get("key_tweets", 5))
+
 # Link expansion
 LINK_FETCH_TIMEOUT: int = CONFIG.get("link_fetch_timeout_seconds", 7)
 LINK_MAX_CONTENT_CHARS: int = CONFIG.get("link_max_content_chars", 3500)
@@ -168,6 +177,23 @@ def log(msg: str) -> None:
     log_file = LOG_DIR / f"{datetime.now():%Y-%m}.log"
     with open(log_file, "a") as f:
         f.write(line + "\n")
+
+
+def keychain_get(service: str) -> str:
+    """Read a generic password from the macOS login keychain.
+
+    Used for the Telegram bot token (service name from config) and any
+    other small secret we don't want baked into source or config.json."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a",
+         os.environ.get("USER", ""), "-s", service, "-w"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"keychain read failed for '{service}': {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
 
 
 def load_state() -> dict:
@@ -673,6 +699,29 @@ The "Worth listening" label must be exactly one of: **SKIP**, **SKIM**, or **LIS
 - **LISTEN**: original substantive content (research, novel take, high-quality guest, new data). Play it properly.
 
 REMEMBER: first output characters must be `## {first_section}`. No preamble, no meta-commentary, no "I'll search".
+
+## Required final section: Key Tweets
+
+After all your content sections, add a FINAL section titled exactly `## Key Tweets`. In it, output exactly {TELEGRAM_KEY_TWEETS} tweet URLs — the ones from the X TWEETS source material that best represent the most interesting, share-worthy, or foundational stories of this batch. These will be used as standalone link previews in a push notification, so pick:
+
+- Tweets that have substantive original content (not just reactions/memes)
+- A mix across your mandatory sections where possible (don't pick all from one theme)
+- High-signal primary sources over commentary/retweets when you have the choice
+- The tweet URLs (the `tweet_link:` value in the source material), NOT links from web search
+
+Format the section as plain URLs, one per line, no commentary, no markdown formatting:
+
+```
+## Key Tweets
+
+https://x.com/author/status/123
+https://x.com/author/status/456
+https://x.com/author/status/789
+https://x.com/author/status/012
+https://x.com/author/status/345
+```
+
+If there are genuinely fewer than {TELEGRAM_KEY_TWEETS} worth-sharing tweets, output fewer — don't pad with junk. This section will be STRIPPED from the document the reader opens; it exists only to drive link previews in a separate channel.
 
 {defillama_text}
 
@@ -1452,6 +1501,200 @@ def load_yesterdays_journal() -> str | None:
     return f"## Yesterday's Claude Code Work — {yesterday_display}\n\n{body}"
 
 
+# --- Telegram delivery (opt-in) ---------------------------------------------
+
+KEY_TWEETS_HEADER_RE = re.compile(
+    r"^##\s*Key\s*Tweets\s*$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def extract_and_strip_key_tweets(claude_markdown: str) -> tuple[str, list[str]]:
+    """Find the `## Key Tweets` section in Claude's output, extract the
+    tweet URLs, and strip the section from the markdown so it doesn't
+    render in the HTML brief.
+
+    Returns (markdown_without_section, [url1, url2, ...]).
+    """
+    m = KEY_TWEETS_HEADER_RE.search(claude_markdown)
+    if not m:
+        return claude_markdown, []
+    start = m.start()
+    # The section runs from the header to the next `## ` header or EOF.
+    rest = claude_markdown[m.end():]
+    next_section = re.search(r"^##\s+", rest, re.MULTILINE)
+    if next_section:
+        section_text = rest[:next_section.start()]
+        # Keep content after the Key Tweets section
+        tail = rest[next_section.start():]
+    else:
+        section_text = rest
+        tail = ""
+
+    # Extract URLs — accept both bare lines and bulleted lines.
+    urls: list[str] = []
+    for line in section_text.splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        # Also handle markdown link format: [label](url)
+        md_match = re.search(r"\]\((https?://[^)]+)\)", line)
+        if md_match:
+            urls.append(md_match.group(1))
+            continue
+        # Plain URL
+        plain = re.search(r"https?://\S+", line)
+        if plain:
+            url = plain.group(0).rstrip(".,);:!?")
+            urls.append(url)
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+    cleaned_markdown = (claude_markdown[:start].rstrip() + "\n\n" + tail.lstrip()).strip()
+    return cleaned_markdown, urls
+
+
+def build_telegram_summary(
+    claude_markdown: str,
+    item_count: int,
+    feed_count: int,
+    defillama_snapshot: dict | None,
+) -> str:
+    """Short text summary for Telegram — first bullet from each section,
+    capped under Telegram's 4096-char message limit."""
+    now = datetime.now()
+    lines = [
+        f"*Morning Brief* · {now:%a %b %-d, %-I:%M %p}",
+        f"{item_count} items across {feed_count} sources",
+    ]
+    if defillama_snapshot and "dexs" in defillama_snapshot:
+        d = defillama_snapshot["dexs"]
+        t = d.get("total_24h")
+        c = d.get("change_1d")
+        if t:
+            if c is not None:
+                lines.append(f"DEX 24h: ${t/1e9:.1f}B ({c:+.1f}%)")
+            else:
+                lines.append(f"DEX 24h: ${t/1e9:.1f}B")
+    lines.append("")
+
+    # Extract first bullet from each `## Section`
+    sections = re.split(r"\n## ", claude_markdown)
+    for s in sections[1:]:  # skip preamble
+        header, _, rest = s.partition("\n")
+        header = header.strip()
+        if header.lower().startswith("key tweets"):
+            continue  # we handle key tweets separately
+        # First bullet
+        bullets = [ln.strip() for ln in rest.splitlines() if ln.strip().startswith("- ")]
+        if not bullets:
+            continue
+        first = bullets[0][2:]  # strip "- "
+        # Trim to keep each section short
+        if len(first) > 240:
+            first = first[:240].rstrip() + "…"
+        lines.append(f"*{header}*")
+        lines.append(first)
+        lines.append("")
+
+    text = "\n".join(lines).strip()
+    # Telegram hard limit 4096 chars per message
+    if len(text) > 3800:
+        text = text[:3800].rstrip() + "…"
+    return text
+
+
+def _telegram_post(token: str, method: str, data: dict, files: dict | None = None, timeout: int = 30) -> dict:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    r = requests.post(url, data=data, files=files, timeout=timeout)
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "error_code": r.status_code, "description": r.text[:500]}
+
+
+def send_telegram_brief(
+    html_path: Path,
+    claude_markdown: str,
+    key_tweet_urls: list[str],
+    item_count: int,
+    stats: dict,
+    defillama_snapshot: dict | None,
+) -> bool:
+    """Push the brief to Telegram: summary text → N tweet URLs (each gets
+    its own message so Telegram renders preview cards) → HTML file
+    attachment. Returns True on full success."""
+    if not TELEGRAM_ENABLED:
+        return False
+    if not TELEGRAM_CHAT_ID:
+        log("  telegram: no chat_id in config — skipping")
+        return False
+    try:
+        token = keychain_get(TELEGRAM_KEYCHAIN_SERVICE)
+    except RuntimeError as e:
+        log(f"  telegram: keychain read failed: {e}")
+        return False
+
+    sent_ok = True
+
+    # 1. Short text summary
+    summary = build_telegram_summary(
+        claude_markdown, item_count, len(FEEDS), defillama_snapshot
+    )
+    resp = _telegram_post(
+        token, "sendMessage",
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": summary,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": "true",
+        },
+    )
+    if not resp.get("ok"):
+        log(f"  telegram summary failed: {resp.get('description', resp)}")
+        sent_ok = False
+
+    # 2. Key tweet previews — one URL per message so Telegram makes cards.
+    # Cap to TELEGRAM_KEY_TWEETS. If Claude didn't emit enough, just skip the rest.
+    for i, url in enumerate(key_tweet_urls[:TELEGRAM_KEY_TWEETS], 1):
+        resp = _telegram_post(
+            token, "sendMessage",
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": url,
+                "disable_web_page_preview": "false",
+            },
+        )
+        if not resp.get("ok"):
+            log(f"  telegram tweet {i} failed: {resp.get('description', resp)}")
+
+    # 3. HTML file attachment — tap-to-open in Telegram's built-in browser
+    try:
+        with open(html_path, "rb") as f:
+            caption = (
+                f"Full brief · {item_count} items · "
+                f"{stats.get('duration_seconds', 0)}s · "
+                f"tap to read"
+            )
+            resp = _telegram_post(
+                token, "sendDocument",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption,
+                },
+                files={
+                    "document": (html_path.name, f, "text/html"),
+                },
+                timeout=60,
+            )
+        if not resp.get("ok"):
+            log(f"  telegram sendDocument failed: {resp.get('description', resp)}")
+            sent_ok = False
+    except Exception as e:
+        log(f"  telegram sendDocument error: {e}")
+        sent_ok = False
+
+    return sent_ok
+
+
 # --- local file output + notification ---------------------------------------
 
 def write_brief_to_disk(
@@ -1578,6 +1821,13 @@ def main() -> int:
         )
         return 3
 
+    # Extract the ## Key Tweets section from Claude's output — URLs are
+    # used for Telegram link previews and the section is stripped so it
+    # never appears in the HTML document the user reads.
+    claude_markdown, key_tweet_urls = extract_and_strip_key_tweets(claude_markdown)
+    if key_tweet_urls:
+        log(f"extracted {len(key_tweet_urls)} key tweet URLs for Telegram")
+
     # Morning run prepends yesterday's Claude Code journal summary.
     # "Morning" = any run fired between 5am and noon local time. This covers
     # both the on-schedule 7am run AND late-fire cases where the Mac was
@@ -1628,6 +1878,23 @@ def main() -> int:
         subtitle=subtitle,
         message=f"Top categories: {top_cats}",
     )
+
+    # Push to Telegram if enabled. Non-fatal: failure logs but doesn't
+    # block state update or return code.
+    if TELEGRAM_ENABLED:
+        log("pushing to Telegram")
+        try:
+            ok = send_telegram_brief(
+                html_path=archive_path,
+                claude_markdown=claude_markdown,
+                key_tweet_urls=key_tweet_urls,
+                item_count=len(new_items),
+                stats=stats,
+                defillama_snapshot=defillama_snapshot,
+            )
+            log(f"  telegram: {'sent' if ok else 'partial/failed'}")
+        except Exception as e:
+            log(f"  telegram error: {e}")
 
     state["seen_ids"].extend(it["id"] for it in new_items)
     save_state(state)
