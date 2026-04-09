@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for twitter-digest.
+
+  Instructions:
+  1. Copy this file to ~/Library/LaunchAgents/ and rename the label +
+     filename (e.g. com.yourname.twitter-digest.plist).
+  2. Edit the four REPLACE_ME placeholders below to point at your clone.
+  3. Adjust the Hour values in StartCalendarInterval if you want a
+     different schedule. launchd uses your Mac's local time.
+  4. Load it: launchctl load ~/Library/LaunchAgents/<your-file>.plist
+  5. Check it: launchctl list | grep twitter-digest
+  6. Trigger once for testing: launchctl start com.yourname.twitter-digest
+
+  Notes:
+  - WorkingDirectory should be the absolute path to your clone.
+  - PATH must include the directory containing `claude` (usually
+    ~/.local/bin) and the python you installed requirements into.
+  - If your Mac is asleep at a scheduled time, launchd fires once
+    on wake — it does not catch up on multiple missed slots.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.twitter-digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_ME_ABSOLUTE_PATH_TO_PYTHON3</string>
+        <string>REPLACE_ME_ABSOLUTE_PATH_TO/twitter-digest/digest.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>REPLACE_ME_ABSOLUTE_PATH_TO/twitter-digest</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>REPLACE_ME_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>REPLACE_ME_HOME</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>7</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>20</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_ME_ABSOLUTE_PATH_TO/twitter-digest/logs/launchd.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>REPLACE_ME_ABSOLUTE_PATH_TO/twitter-digest/logs/launchd.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

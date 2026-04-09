@@ -1,0 +1,32 @@
+# User-specific config — NEVER commit
+config.json
+
+# Runtime state
+state.json
+last-digest.md
+last-prompt.md
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Generated plists installed from template (users edit a local copy)
+*.plist.installed
