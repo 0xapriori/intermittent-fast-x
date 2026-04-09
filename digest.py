@@ -148,8 +148,15 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    """Atomic write: serialize to state.json.tmp, then rename.
+
+    os.replace() is atomic on POSIX filesystems, so state.json is either
+    fully the old content or fully the new content — never half-written,
+    even if the process is killed during the write."""
     state["seen_ids"] = state["seen_ids"][-MAX_SEEN_IDS:]
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
 
 
 # --- feed parsing -----------------------------------------------------------
@@ -216,17 +223,54 @@ def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
     return urls
 
 
+FEED_FETCH_TIMEOUT: int = CONFIG.get("feed_fetch_timeout_seconds", 30)
+
+
+def _fetch_feed_bytes(url: str) -> bytes | None:
+    """Fetch a feed URL with a hard timeout, return raw bytes or raise.
+
+    feedparser.parse() has no timeout parameter and will silently hang on
+    slow servers. Pre-fetching with requests.get(timeout=...) gives us a
+    guaranteed upper bound, then we hand the bytes to feedparser.
+    """
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            },
+            timeout=FEED_FETCH_TIMEOUT,
+            allow_redirects=True,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        return r.content
+    except Exception as e:
+        raise RuntimeError(str(e)[:200])
+
+
+# Collected at runtime so we can surface them in the brief itself
+FAILED_FEEDS: list[dict] = []
+
+
 def fetch_all_feeds() -> list[dict]:
     """Fetch every configured feed and return a list of entries tagged with
-    feed name and source category."""
+    feed name and source category. Individual-feed failures are logged and
+    recorded in FAILED_FEEDS but do NOT stop the run."""
+    FAILED_FEEDS.clear()
     all_items: list[dict] = []
     for feed_cfg in FEEDS:
         category = feed_cfg.get("category", "x-twitter")
         max_items = feed_cfg.get("max_items")
+        name = feed_cfg["name"]
         try:
-            parsed = feedparser.parse(feed_cfg["url"])
+            raw = _fetch_feed_bytes(feed_cfg["url"])
+            parsed = feedparser.parse(raw)
             if parsed.bozo and not parsed.entries:
-                log(f"  ✗ {feed_cfg['name']} [{category}]: parse failed ({parsed.bozo_exception})")
+                reason = f"parse failed ({parsed.bozo_exception})"
+                log(f"  ✗ {name:28s} [{category:10s}] {reason}")
+                FAILED_FEEDS.append({"name": name, "category": category, "reason": reason})
                 continue
             entries = parsed.entries
             if max_items:
@@ -240,7 +284,7 @@ def fetch_all_feeds() -> list[dict]:
                 text = normalize_content(category, desc_html, title)
                 all_items.append({
                     "id": guid,
-                    "feed": feed_cfg["name"],
+                    "feed": name,
                     "category": category,
                     "author": entry.get("author", "unknown"),
                     "title": title,
@@ -250,9 +294,11 @@ def fetch_all_feeds() -> list[dict]:
                     "published": entry.get("published", ""),
                     "urls": extract_urls(text, desc_html),
                 })
-            log(f"  ✓ {feed_cfg['name']:28s} [{category:10s}] {len(entries)} items")
+            log(f"  ✓ {name:28s} [{category:10s}] {len(entries)} items")
         except Exception as e:
-            log(f"  ✗ {feed_cfg['name']} [{category}]: {e}")
+            reason = str(e)[:200]
+            log(f"  ✗ {name:28s} [{category:10s}] {reason}")
+            FAILED_FEEDS.append({"name": name, "category": category, "reason": reason})
     return all_items
 
 
@@ -575,6 +621,73 @@ def _strip_preamble(markdown: str) -> str:
     return markdown.strip()
 
 
+def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> subprocess.CompletedProcess:
+    """Run a subprocess with a REAL timeout that actually kills the child.
+
+    subprocess.run(timeout=...) has a known failure mode where it can hang
+    indefinitely inside communicate() if the child process doesn't return
+    promptly. We observed this in production: a `claude -p` child hung for
+    3+ hours on a stalled network call and subprocess.run never raised.
+
+    This helper uses Popen + a watchdog poll loop. We escalate:
+      1. At timeout: SIGTERM (graceful)
+      2. 5 seconds later if still alive: SIGKILL (hard)
+    We always return OR raise RuntimeError — never hang forever.
+    """
+    import time as _time
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError) as e:
+        proc.kill()
+        proc.wait(timeout=5)
+        raise RuntimeError(f"failed to write prompt to claude -p: {e}")
+
+    deadline = datetime.now().timestamp() + timeout_s
+    poll_interval = 2.0
+
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            stdout = proc.stdout.read() or ""
+            stderr = proc.stderr.read() or ""
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=rc, stdout=stdout, stderr=stderr,
+            )
+        if datetime.now().timestamp() >= deadline:
+            log(f"  claude -p exceeded {timeout_s}s — sending SIGTERM")
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log("  child didn't exit on SIGTERM — sending SIGKILL")
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+            try:
+                stdout = proc.stdout.read() or ""
+                stderr = proc.stderr.read() or ""
+            except Exception:
+                stdout = stderr = ""
+            raise RuntimeError(
+                f"claude -p killed by watchdog after {timeout_s}s "
+                f"(last stderr: {stderr[:300]!r})"
+            )
+        _time.sleep(poll_interval)
+
+
 def summarize(items: list[dict]) -> tuple[str, dict]:
     """Invoke `claude -p` (Claude Code non-interactive) to summarize.
 
@@ -583,8 +696,6 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     without an API web_search add-on.
     """
     prompt = build_prompt(items)
-
-    # Persist the prompt for debugging / reproducibility
     (BASE_DIR / "last-prompt.md").write_text(prompt)
 
     start = datetime.now()
@@ -595,18 +706,8 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     ]
     log(f"  invoking: {' '.join(cmd)}")
 
-    try:
-        result = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_CLI_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"claude -p timed out after {CLAUDE_CLI_TIMEOUT}s"
-        )
+    # Watchdog helper: guarantees return OR raise within timeout, never hangs.
+    result = _run_claude_with_watchdog(cmd, prompt, CLAUDE_CLI_TIMEOUT)
 
     duration = (datetime.now() - start).total_seconds()
 
@@ -688,6 +789,25 @@ def load_yesterdays_journal() -> str | None:
 
 
 # --- HTML brief rendering ---------------------------------------------------
+
+def _failed_feeds_html() -> str:
+    """Small HTML block listing any feeds that failed this run.
+    Empty string if nothing failed."""
+    if not FAILED_FEEDS:
+        return ""
+    items_html = "".join(
+        f'<li style="color:#9a3412;margin:4px 0;"><strong style="color:#9a3412;">{f["name"]}</strong> <span style="color:#a16207;">[{f["category"]}]</span> — {f["reason"]}</li>'
+        for f in FAILED_FEEDS
+    )
+    return (
+        '<div style="margin:20px 0;padding:12px 16px;background:#fef3c7;border:1px solid #fcd34d;border-radius:6px;">'
+        '<div style="font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;font-size:12px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">'
+        f'⚠ {len(FAILED_FEEDS)} feed(s) failed this run'
+        '</div>'
+        f'<ul style="margin:4px 0 0 0;padding-left:18px;font-family:-apple-system,\'Segoe UI\',Roboto,sans-serif;font-size:13px;line-height:1.5;">{items_html}</ul>'
+        '</div>'
+    )
+
 
 def render_brief_html(claude_markdown: str, items: list[dict], stats: dict) -> str:
     """Render a readable HTML brief from Claude's markdown output.
@@ -781,12 +901,14 @@ def render_brief_html(claude_markdown: str, items: list[dict], stats: dict) -> s
 </div>
 </div>
 
+{_failed_feeds_html()}
+
 <div>
 {body_html}
 </div>
 
 <div style="margin-top:48px;padding-top:20px;border-top:1px solid #e2e8f0;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;color:#94a3b8;line-height:1.5;">
-Generated by digest.py &middot; model: {MODEL} via claude&nbsp;-p &middot; {stats.get('duration_seconds', 0)}s
+Generated by digest.py &middot; model: {MODEL} via claude&nbsp;-p &middot; {stats.get('duration_seconds', 0)}s{f" &middot; {len(FAILED_FEEDS)} feeds failed" if FAILED_FEEDS else ""}
 </div>
 
 </div>
@@ -881,12 +1003,21 @@ def main() -> int:
         )
     except Exception as e:
         log(f"ERROR calling claude -p: {e}")
+        notify_macos(
+            title="Brief FAILED",
+            subtitle=f"claude -p error ({type(e).__name__})",
+            message=str(e)[:140],
+        )
         return 3
 
-    # Morning run (7am) prepends yesterday's Claude Code journal summary.
-    # Set FORCE_MORNING_PREPEND=1 to test outside the 7am slot.
+    # Morning run prepends yesterday's Claude Code journal summary.
+    # "Morning" = any run fired between 5am and noon local time. This covers
+    # both the on-schedule 7am run AND late-fire cases where the Mac was
+    # asleep at 7am and launchd finally fired at e.g. 9am when you opened
+    # the lid. Set FORCE_MORNING_PREPEND=1 to force outside this window.
+    now_hour = datetime.now().hour
     is_morning_run = (
-        datetime.now().hour == 7
+        (5 <= now_hour < 12)
         or os.environ.get("FORCE_MORNING_PREPEND", "").lower() in ("1", "true", "yes")
     )
     if is_morning_run:
@@ -913,9 +1044,12 @@ def main() -> int:
     top_cats = ", ".join(
         f"{v} {k}" for k, v in sorted(sources_by_cat.items(), key=lambda x: -x[1])[:3]
     )
+    subtitle = f"{len(new_items)} items across {len(FEEDS)} sources"
+    if FAILED_FEEDS:
+        subtitle += f" · {len(FAILED_FEEDS)} feeds failed"
     notify_macos(
         title="Research Brief ready",
-        subtitle=f"{len(new_items)} items across {len(FEEDS)} sources",
+        subtitle=subtitle,
         message=f"Top categories: {top_cats}",
     )
 
@@ -926,5 +1060,30 @@ def main() -> int:
     return 0
 
 
+def _main_with_fatal_notifier() -> int:
+    """Wraps main() so any uncaught exception fires a failure notification
+    and gets logged — nothing fails silently."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        log("interrupted by user (SIGINT)")
+        return 130
+    except Exception as e:
+        log(f"FATAL: uncaught {type(e).__name__}: {e}")
+        import traceback
+        log(traceback.format_exc())
+        try:
+            notify_macos(
+                title="Brief CRASHED",
+                subtitle=f"uncaught {type(e).__name__}",
+                message=str(e)[:140],
+            )
+        except Exception:
+            pass
+        return 99
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main_with_fatal_notifier())

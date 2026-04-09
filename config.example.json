@@ -63,6 +63,7 @@
 
   "web_search_budget_hint": 10,
   "claude_cli_timeout_seconds": 1800,
+  "feed_fetch_timeout_seconds": 30,
   "max_seen_ids": 2000,
   "link_fetch_timeout_seconds": 7,
   "link_max_content_chars": 3500,
