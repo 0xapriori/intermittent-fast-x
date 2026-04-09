@@ -46,12 +46,12 @@
   "model": "claude-opus-4-6",
 
   "sections": {
-    "mandatory": ["Ethereum", "Solana", "AI"],
+    "mandatory": ["Ethereum", "Solana", "AI", "Hacker News"],
     "optional": ["Bitcoin"],
     "exclusions": [
-      "politics, elections, politicians, culture war, ideology",
-      "price speculation, TA charts, 'wen moon'",
-      "personal drama, Twitter fights"
+      "politics, elections, politicians, government policy debates, geopolitical conflict, culture war, ideology. If a tweet is half-crypto half-politics (e.g., 'the president's crypto EO'), keep the crypto fact and drop the political framing.",
+      "crypto price speculation, TA charts, or 'wen moon' content unless it's a major macro shift with a concrete catalyst.",
+      "personal drama, beef, or Twitter fights unless they're about a protocol's technical direction."
     ]
   },
 

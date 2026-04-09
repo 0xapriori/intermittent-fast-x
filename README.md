@@ -183,14 +183,18 @@ Edit `config.json`:
   - `max_items` (optional; caps items from this source per run — useful for chatty feeds)
 
 - **`sections.mandatory`**: section headers that always appear in the brief
-  even if there's nothing to report (they'll say "Nothing substantial this
-  window"). Default: `["Ethereum", "Solana", "AI"]`.
+  even if there's nothing to report (empty ones say "Nothing substantial this
+  window"). Default: `["Ethereum", "Solana", "AI", "Hacker News"]`. The first
+  four names are "known" and get built-in prompt guidance; any additional
+  name you add will appear in the output but without per-section guidance
+  (you can extend `SECTION_GUIDANCE` in `digest.py` to add more).
 
 - **`sections.optional`**: sections that only appear when Claude finds
   substantive content. Default: `["Bitcoin"]`.
 
-- **`sections.exclusions`**: topics Claude should drop entirely. Default
-  drops politics, price speculation, and personal drama.
+- **`sections.exclusions`**: topics Claude should drop entirely. Each entry
+  is a sentence the model sees verbatim in the prompt's "Hard exclusions"
+  block. Default drops politics, price speculation, and personal drama.
 
 - **`output`**:
   - `briefs_dir`: where to write timestamped archives. Default: `briefs/` next to the script.
@@ -305,9 +309,10 @@ launchctl list com.yourname.intermittent-fast-x
 |---|---|---|
 | `sources[]` | Array of `{name, url, category, max_items?}`. | required |
 | `model` | Claude model passed to `claude -p --model`. | `claude-opus-4-6` |
-| `sections.mandatory` | Section headers that always appear. | `[Ethereum, Solana, AI]` |
+| `sections.mandatory` | Section headers that always appear. | `[Ethereum, Solana, AI, Hacker News]` |
 | `sections.optional` | Sections that appear only if there's content. | `[Bitcoin]` |
-| `sections.exclusions` | Topics Claude must drop. | politics, price speculation, drama |
+| `sections.exclusions` | Topics Claude must drop (verbatim into the prompt). | politics, price speculation, drama |
+| `feed_fetch_timeout_seconds` | Per-feed HTTP timeout. | `30` |
 | `output.briefs_dir` | Directory for timestamped brief archives. | `briefs/` next to script |
 | `output.latest_pointer` | Path for the always-newest brief. | `latest-brief.html` next to script |
 | `output.show_macos_notification` | Post-run notification. | `true` |

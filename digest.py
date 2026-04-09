@@ -225,6 +225,39 @@ def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
 
 FEED_FETCH_TIMEOUT: int = CONFIG.get("feed_fetch_timeout_seconds", 30)
 
+# Section config: user-overridable via CONFIG["sections"]. Defaults chosen
+# to match the previously-hardcoded sections for backward compatibility.
+_sections_cfg = CONFIG.get("sections", {})
+MANDATORY_SECTIONS: list[str] = _sections_cfg.get(
+    "mandatory", ["Ethereum", "Solana", "AI", "Hacker News"]
+)
+OPTIONAL_SECTIONS: list[str] = _sections_cfg.get("optional", ["Bitcoin"])
+EXCLUSIONS: list[str] = _sections_cfg.get(
+    "exclusions",
+    [
+        "politics, elections, politicians, government policy debates, "
+        "geopolitical conflict, culture war, ideology. If a tweet is "
+        "half-crypto half-politics (e.g., \"the president's crypto EO\"), "
+        "keep the crypto fact and drop the political framing. If a tweet is "
+        "purely political, drop it entirely — do not mention it, do not search for it.",
+        "crypto price speculation, TA charts, or \"wen moon\" content "
+        "unless it's a major macro shift with a concrete catalyst.",
+        "personal drama, beef, or Twitter fights unless they're about a "
+        "protocol's technical direction.",
+    ],
+)
+
+# Per-section one-line guidance for the "Mandatory section structure" block
+# of the prompt. Unknown sections get the section name alone (no guidance);
+# users can add custom sections by editing this dict or extending via config.
+SECTION_GUIDANCE: dict[str, str] = {
+    "Ethereum":    "ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling",
+    "Solana":      "SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps",
+    "AI":          "AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.",
+    "Hacker News": 'The top stories trending on HN frontpage right now, across any topic (not just AI/crypto). See the "Hacker News section requirements" below for specifics.',
+    "Bitcoin":     "BTC core, ordinals, Lightning, ETF flows, regulatory news.",
+}
+
 
 def _fetch_feed_bytes(url: str) -> bytes | None:
     """Fetch a feed URL with a hard timeout, return raw bytes or raise.
@@ -483,6 +516,49 @@ def build_prompt(items: list[dict]) -> str:
         f"{len(items_by_cat.get(c, []))} {c}" for c in CATEGORY_ORDER if items_by_cat.get(c)
     )
 
+    # --- dynamic section / exclusion scaffolding from config ---
+    mandatory_count = len(MANDATORY_SECTIONS)
+    mandatory_section_list = "\n".join(
+        f"{i+1}. `## {name}` — {SECTION_GUIDANCE.get(name, name)}"
+        for i, name in enumerate(MANDATORY_SECTIONS)
+    )
+
+    # The Hacker News section has detailed requirements — only emit the
+    # requirements block if HN is actually in the mandatory list.
+    if "Hacker News" in MANDATORY_SECTIONS:
+        hn_requirements_block = """## Hacker News section requirements
+
+The Hacker News input category contains the current HN frontpage (top stories by points/comments). You MUST summarize them in a dedicated `## Hacker News` section with the following rules:
+
+- **4-8 bullets**, one per meaningful story. Pick the highest-signal items — prioritize technical releases, research, novel tools, substantive writing, industry news. Skip pure rage-bait, off-topic memes, and low-effort link farms.
+- **Scope is NOT limited to AI/crypto.** HN covers the entire tech world. Include anything a curious technical reader would find substantive: new programming languages, OS/kernel news, hardware launches, science papers, infrastructure research, novel products, postmortems, long-form essays, legal/policy news affecting tech, etc.
+- Each bullet format: `- **<Story title or topic>**: 1-2 sentences of summary/context. [HN discussion](url) · [Source](url)`
+- If the HN story links to an external article, link BOTH the HN comments page (usually https://news.ycombinator.com/item?id=...) AND the source URL, so the reader can choose discussion or article.
+- If a top story is already covered in another mandatory section, skip it here to avoid duplication. Note at the end: "(Top AI stories covered in the AI section above.)"
+- **Do NOT dismiss this section with "nothing substantial".** HN frontpage always has content; the job is to find the 4-8 most interesting items and explain them."""
+    else:
+        hn_requirements_block = ""
+
+    if OPTIONAL_SECTIONS:
+        optional_parts = []
+        for name in OPTIONAL_SECTIONS:
+            guide = SECTION_GUIDANCE.get(name, "")
+            suffix = f" ({guide})" if guide else ""
+            optional_parts.append(f"`## {name}`{suffix}")
+        optional_list_str = ", ".join(optional_parts)
+        optional_section_clause = (
+            f"Optionally include {optional_list_str} ONLY IF there is substantive "
+            f"content for it. **If there is no content for an optional section, "
+            f"OMIT the section entirely. Do not print an empty header.**"
+        )
+    else:
+        optional_section_clause = ""
+
+    exclusions_block = "\n".join(f"- {e}" for e in EXCLUSIONS)
+
+    # First mandatory section name — used in the "first output characters" hint
+    first_section = MANDATORY_SECTIONS[0] if MANDATORY_SECTIONS else "Ethereum"
+
     return f"""You are producing a signal-driven multi-source digest for a crypto/AI researcher. They do NOT want to visit x.com, read dozens of podcast show notes, skim five governance forums, watch GitHub release feeds, or scan Hacker News themselves. Your job is to synthesize WHAT HAPPENED and WHAT IS BEING DISCUSSED across all sources, grounded in real external links.
 
 ## Input sources ({category_counts})
@@ -521,40 +597,23 @@ Do NOT search for:
 
 ## Mandatory section structure
 
-Your digest MUST always include these four sections in this order:
+Your digest MUST always include these {mandatory_count} sections in this order:
 
-1. `## Ethereum` — ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling
-2. `## Solana` — SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps
-3. `## AI` — AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.
-4. `## Hacker News` — The top stories trending on HN frontpage right now, across any topic (not just AI/crypto). See the "Hacker News section requirements" below for specifics.
+{mandatory_section_list}
 
-## Hacker News section requirements
+{hn_requirements_block}
 
-The Hacker News input category contains the current HN frontpage (top stories by points/comments). You MUST summarize them in a dedicated `## Hacker News` section with the following rules:
+{optional_section_clause}
 
-- **4-8 bullets**, one per meaningful story. Pick the highest-signal items — prioritize technical releases, research, novel tools, substantive writing, industry news. Skip pure rage-bait, off-topic memes, and low-effort link farms.
-- **Scope is NOT limited to AI/crypto.** HN covers the entire tech world. Include anything a curious technical reader would find substantive: new programming languages, OS/kernel news, hardware launches, science papers, infrastructure research, novel products, postmortems, long-form essays, legal/policy news affecting tech, etc.
-- Each bullet format: `- **<Story title or topic>**: 1-2 sentences of summary/context. [HN discussion](url) · [Source](url)`
-- If the HN story links to an external article, link BOTH the HN comments page (usually https://news.ycombinator.com/item?id=...) AND the source URL, so the reader can choose discussion or article.
-- If the top story is already covered in the Ethereum/Solana/AI sections (e.g., a major Anthropic release is #1 on HN AND in the AI section), skip it here to avoid duplication. Note at the end: "(Top AI stories covered in the AI section above.)"
-- **Do NOT dismiss this section with "nothing substantial".** HN frontpage always has content; the job is to find the 4-8 most interesting items and explain them.
-
-Optionally include `## Bitcoin` ONLY IF there is substantive Bitcoin content (BTC core, ordinals, Lightning, ETF flows, regulatory news). **If there is no Bitcoin content, OMIT the section entirely. Do not print an empty Bitcoin header.**
-
-**Do not dismiss content too easily.** Check across ALL source types before marking a section empty. Signals by section:
-- **Ethereum**: mentions of Base, Arbitrum, Optimism, Polygon, restaking, EigenLayer, LSTs, ETH staking, MEV, rollups, L2s, EIPs, Uniswap/Aave/Morpho/Pendle/Lido, ENS, Farcaster, Reth/Geth/Erigon, Foundry, Flashbots, any Ethereum governance thread, any ETH ecosystem forum post, any eip-* GitHub commit.
-- **Solana**: mentions of Jupiter, Phantom, Jito, Pump.fun, Helius, Metaplex, Firedancer/Agave releases, SIMD proposals, SOL ETFs, Solana Mobile, any SOL ecosystem app.
-- **AI**: mentions of Claude, GPT, Gemini, LLaMA, Anthropic, OpenAI, Google DeepMind, Meta AI, xAI, agents, RAG, MCP, HuggingFace releases, arxiv papers, model launches, inference cost / latency, training runs, GPU supply, AI safety, interpretability, autoresearch, any AI-adjacent HN story with enough signal.
+**Do not dismiss content too easily.** Check across ALL source types before marking a section empty.
 
 **Minimum depth when content exists**: if a section has ANY relevant content in the batch, produce **at least 2 substantive bullets**. Don't stop at 1.
 
-**Empty sections (Ethereum/Solana/AI only)**: write exactly this single line under the header, nothing else: `_Nothing substantial this window._`
+**Empty mandatory sections**: write exactly this single line under the header, nothing else: `_Nothing substantial this window._`
 
 ## Hard exclusions
 
-- **NO POLITICS**. Drop any tweet about elections, politicians, government policy debates, geopolitical conflict, culture war, or ideology. If a tweet is half-crypto half-politics (e.g., "the president's crypto EO"), keep the crypto fact and drop the political framing. If a tweet is purely political, drop it entirely — do not mention it, do not search for it.
-- No crypto price speculation, TA charts, or "wen moon" content unless it's a major macro shift with a concrete catalyst.
-- No personal drama, beef, or Twitter fights unless they're about a protocol's technical direction.
+{exclusions_block}
 
 ## Output format — PLAIN MARKDOWN
 
@@ -569,7 +628,7 @@ Output ONLY these markdown elements:
 
 **Link requirement**: every substantive bullet MUST end with at least one `[label](url)` link to an external source. No exceptions.
 
-**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## Ethereum`. Anything before that will be stripped and discarded.
+**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## {first_section}`. Anything before that will be stripped and discarded.
 
 **NO item-number references.** Never write "(tweet 11)", "item 3", "post #5", or any numeric reference to the input scaffolding. The bracketed numbers on each item are internal — the reader will never see them. Refer to the account, the podcast name, the repo, or the topic instead.
 
@@ -594,7 +653,7 @@ The "Worth listening" label must be exactly one of: **SKIP**, **SKIM**, or **LIS
 - **SKIM**: read the show notes, maybe play at 2x, maybe jump to timestamps. Worth awareness but not full attention.
 - **LISTEN**: original substantive content (research, novel take, high-quality guest, new data). Play it properly.
 
-REMEMBER: first output characters must be `## Ethereum`. No preamble, no meta-commentary, no "I'll search".
+REMEMBER: first output characters must be `## {first_section}`. No preamble, no meta-commentary, no "I'll search".
 
 ## Source material ({len(items)} items)
 
