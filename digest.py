@@ -1,45 +1,37 @@
 #!/usr/bin/env python3
-"""Twitter digest: multi-feed, article expansion, plain-markdown email.
+"""Multi-source research brief: RSS feeds + article expansion → local HTML.
 
-Fetches multiple rss.app feeds (each one turned into a feed from a private X
-List), dedupes against state, pre-fetches any linked articles via trafilatura,
-then invokes `claude -p` (Claude Code non-interactive) to synthesize a
-themed digest that is delivered by Gmail SMTP.
+Fetches many RSS feeds (curated X Lists, podcasts, forums, GitHub, AI blogs,
+HN, MEV/DeFi research), dedupes against state, expands linked articles via
+trafilatura, then invokes `claude -p` (Claude Code non-interactive) to
+synthesize a themed brief. Output is written to a local HTML file and
+optionally surfaced via a macOS notification.
 
-By default this runs against your Claude Max subscription through the local
-`claude` CLI — no Anthropic API key is required and there is no per-token or
-per-search fee. If you prefer the paid API, see the README.
-
-Secrets and per-user config:
-  - config.json (gitignored)   : feeds, sender/recipient email, etc.
-  - macOS keychain entry       : Gmail app password (service name from config)
-  - Claude OAuth               : handled transparently by `claude -p` on first
-                                  interactive login; no setup needed in-script.
+No email. No IMAP. No SMTP. No outbound credentials of any kind.
+Everything stays on your machine except the `claude -p` invocation itself
+(which uses your existing Claude Max OAuth — same trust boundary as any
+other Claude Code session).
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import smtplib
 import subprocess
 import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from email.mime.text import MIMEText
 from html import unescape
 from pathlib import Path
 
 import feedparser
+import markdown as md_lib
 import requests
 import trafilatura
 
 # --- paths ------------------------------------------------------------------
 
-# Everything the script reads or writes lives next to the script itself,
-# not in a hard-coded absolute path. This makes the tool portable and safe to
-# clone to any machine.
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "state.json"
@@ -48,40 +40,79 @@ LOG_DIR = BASE_DIR / "logs"
 
 # --- config loading ---------------------------------------------------------
 
-def load_config() -> dict:
+def _load_config() -> dict:
     if not CONFIG_FILE.exists():
         raise SystemExit(
-            f"Missing {CONFIG_FILE}. Copy config.example.json to config.json "
-            f"and fill in your feeds + email addresses."
+            f"Missing {CONFIG_FILE}.\n"
+            f"Copy config.example.json to config.json and fill in your sources."
         )
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
 
-CONFIG = load_config()
+CONFIG = _load_config()
 
-FEEDS: list[dict] = CONFIG["feeds"]
-EMAIL_FROM: str = CONFIG["email"]["from"]
-EMAIL_TO: str = CONFIG["email"]["to"]
-GMAIL_KEYCHAIN_SERVICE: str = CONFIG.get("gmail_keychain_service", "twitter-digest-gmail")
+# Sources come from config.json. Each entry: {name, url, category, max_items?}.
+# Categories drive content normalization and how the prompt groups items.
+# All feeds are parsed with feedparser regardless of category.
+FEEDS: list[dict] = CONFIG.get("sources") or []
+if not FEEDS:
+    raise SystemExit("config.json has no 'sources' list — see config.example.json")
 
-MODEL: str = CONFIG.get("model", "claude-opus-4-6")
-CLAUDE_CLI_TIMEOUT: int = CONFIG.get("claude_cli_timeout_seconds", 900)
-WEB_SEARCH_BUDGET_HINT: int = CONFIG.get("web_search_budget_hint", 10)
+# Per-category content truncation (chars) — non-tweet items can have long
+# descriptions; truncate to keep the prompt manageable.
+CONTENT_MAX_CHARS_BY_CATEGORY = {
+    "x-twitter": 600,
+    "podcast":   2200,
+    "forum":     1500,
+    "github":    600,
+    "ai-news":   1500,
+    "hn":        400,
+    "mev-defi":  2000,
+}
+
+# Display labels for categories in the prompt
+CATEGORY_LABELS = {
+    "x-twitter": "X TWEETS (from curated Lists)",
+    "podcast":   "PODCAST EPISODES (show notes — flag worth listening)",
+    "forum":     "FORUM THREADS (governance / research discussions)",
+    "github":    "GITHUB ACTIVITY (commits / releases)",
+    "ai-news":   "AI INDUSTRY NEWS",
+    "hn":        "HACKER NEWS TOP",
+    "mev-defi":  "MEV & DeFi RESEARCH",
+}
+
+# Order categories appear in the prompt (drives which Claude sees first)
+CATEGORY_ORDER = ["x-twitter", "podcast", "forum", "github", "ai-news", "hn", "mev-defi"]
+
+MODEL: str = CONFIG.get("model", "claude-opus-4-6")  # via Max through `claude -p`
+
+# Local output paths. Resolve ~ if the user put a home-relative path in config.
+def _resolve_path(p: str) -> Path:
+    return Path(os.path.expanduser(p)).resolve()
+
+_output = CONFIG.get("output", {})
+BRIEFS_DIR = _resolve_path(_output.get("briefs_dir", str(BASE_DIR / "briefs")))
+LATEST_BRIEF = _resolve_path(
+    _output.get("latest_pointer", str(BASE_DIR / "latest-brief.html"))
+)
+SHOW_NOTIFICATION: bool = bool(_output.get("show_macos_notification", True))
+
 MAX_SEEN_IDS: int = CONFIG.get("max_seen_ids", 2000)
+CLAUDE_CLI_TIMEOUT: int = CONFIG.get("claude_cli_timeout_seconds", 1800)
+WEB_SEARCH_BUDGET_HINT: int = CONFIG.get("web_search_budget_hint", 10)
 
 # Link expansion
 LINK_FETCH_TIMEOUT: int = CONFIG.get("link_fetch_timeout_seconds", 7)
 LINK_MAX_CONTENT_CHARS: int = CONFIG.get("link_max_content_chars", 3500)
 LINK_MAX_PER_TWEET: int = CONFIG.get("link_max_per_tweet", 3)
 LINK_CONCURRENCY: int = CONFIG.get("link_concurrency", 10)
-
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Hosts where linked content isn't worth fetching (X itself, images, video)
+# Domains where the content isn't worth fetching (X itself, images, video, app stores)
 SKIP_HOSTS = {
     "twitter.com", "x.com", "mobile.twitter.com", "mobile.x.com",
     "pic.twitter.com", "pic.x.com", "pbs.twimg.com", "abs.twimg.com",
@@ -91,6 +122,7 @@ SKIP_HOSTS = {
     "instagram.com",
     "apps.apple.com", "play.google.com",
 }
+# Shorteners we should follow-through before deciding
 SHORTENER_HOSTS = {"t.co", "bit.ly", "buff.ly", "lnkd.in", "dlvr.it", "ow.ly"}
 
 
@@ -104,20 +136,6 @@ def log(msg: str) -> None:
     log_file = LOG_DIR / f"{datetime.now():%Y-%m}.log"
     with open(log_file, "a") as f:
         f.write(line + "\n")
-
-
-def keychain_get(service: str) -> str:
-    """Read a generic password from the macOS login keychain."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-a",
-         os.environ.get("USER", ""), "-s", service, "-w"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"keychain read failed for '{service}': {result.stderr.strip()}"
-        )
-    return result.stdout.strip()
 
 
 def load_state() -> dict:
@@ -147,17 +165,47 @@ def strip_tweet_html(html: str) -> str:
     return unescape(text).strip()
 
 
+def strip_generic_html(html: str) -> str:
+    """Generic HTML → plain text for non-tweet RSS items (podcasts, forums,
+    GitHub, blogs, HN). Keeps newlines between paragraphs but drops tags."""
+    if not html:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", html)
+    text = re.sub(r"</(p|div|li|h[1-6])>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def normalize_content(category: str, description_html: str, title: str = "") -> str:
+    """Return plain text body appropriate for a given source category."""
+    if category == "x-twitter":
+        return strip_tweet_html(description_html)
+    body = strip_generic_html(description_html)
+    # For most non-tweet sources the title is a critical signal. Prepend it
+    # if it's not already in the body (avoid dupes for podcasts where the
+    # title is usually the first line of the show notes).
+    if title and title.strip() and title.strip().lower() not in body.lower()[:200]:
+        body = f"{title.strip()}\n\n{body}".strip()
+    cap = CONTENT_MAX_CHARS_BY_CATEGORY.get(category, 1500)
+    return body[:cap]
+
+
 def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
-    """Pull URLs from both the HTML description and text body."""
+    """Pull URLs from both the HTML description (href attrs) and text body."""
     urls: list[str] = []
     seen: set[str] = set()
+    # HTML href attributes — most reliable
     for m in re.finditer(r'href=["\']([^"\']+)["\']', tweet_description_html or ""):
         u = m.group(1)
         if u not in seen:
             seen.add(u)
             urls.append(u)
-    # Plain-text URLs. Reject anything containing a horizontal ellipsis —
-    # those come from rss.app truncating display text for retweets.
+    # Plain-text URLs (catch anything not in an href). Reject anything
+    # containing a horizontal ellipsis or ending in one — those come from
+    # rss.app's truncated display text for retweets, not real URLs.
     for m in re.finditer(r"https?://[^\s<>\"'\u2026]+", tweet_text or ""):
         u = m.group(0).rstrip(".,);:!?")
         if "\u2026" in u or u.endswith("..."):
@@ -169,32 +217,42 @@ def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
 
 
 def fetch_all_feeds() -> list[dict]:
+    """Fetch every configured feed and return a list of entries tagged with
+    feed name and source category."""
     all_items: list[dict] = []
     for feed_cfg in FEEDS:
+        category = feed_cfg.get("category", "x-twitter")
+        max_items = feed_cfg.get("max_items")
         try:
             parsed = feedparser.parse(feed_cfg["url"])
             if parsed.bozo and not parsed.entries:
-                log(f"  ✗ {feed_cfg['name']}: parse failed ({parsed.bozo_exception})")
+                log(f"  ✗ {feed_cfg['name']} [{category}]: parse failed ({parsed.bozo_exception})")
                 continue
-            for entry in parsed.entries:
+            entries = parsed.entries
+            if max_items:
+                entries = entries[:max_items]
+            for entry in entries:
                 guid = entry.get("id") or entry.get("guid") or entry.get("link")
                 if not guid:
                     continue
                 desc_html = entry.get("summary", "") or entry.get("description", "")
-                text = strip_tweet_html(desc_html)
+                title = entry.get("title", "")
+                text = normalize_content(category, desc_html, title)
                 all_items.append({
                     "id": guid,
                     "feed": feed_cfg["name"],
+                    "category": category,
                     "author": entry.get("author", "unknown"),
+                    "title": title,
                     "text": text,
                     "description_html": desc_html,
                     "link": entry.get("link", ""),
                     "published": entry.get("published", ""),
                     "urls": extract_urls(text, desc_html),
                 })
-            log(f"  ✓ {feed_cfg['name']}: {len(parsed.entries)} items")
+            log(f"  ✓ {feed_cfg['name']:28s} [{category:10s}] {len(entries)} items")
         except Exception as e:
-            log(f"  ✗ {feed_cfg['name']}: {e}")
+            log(f"  ✗ {feed_cfg['name']} [{category}]: {e}")
     return all_items
 
 
@@ -213,6 +271,7 @@ def should_fetch(url: str) -> bool:
         return False
     if host in SKIP_HOSTS:
         return False
+    # Path-level skip for x.com article previews (still X)
     if "/i/article/" in url or "/i/web/status/" in url:
         return False
     lowered = url.lower()
@@ -223,6 +282,7 @@ def should_fetch(url: str) -> bool:
 
 
 def resolve_shortener(url: str) -> str:
+    """If url is a known shortener, HEAD-follow to the final location."""
     host = host_of(url)
     if host not in SHORTENER_HOSTS:
         return url
@@ -235,7 +295,7 @@ def resolve_shortener(url: str) -> str:
 
 
 def fetch_article(url: str) -> dict | None:
-    """Fetch a URL and extract main article text via trafilatura."""
+    """Fetch a URL and extract main article text. Returns None on any failure."""
     try:
         final = resolve_shortener(url)
         if not should_fetch(final):
@@ -247,6 +307,7 @@ def fetch_article(url: str) -> dict | None:
         ctype = r.headers.get("content-type", "").lower()
         if "html" not in ctype and "text/plain" not in ctype:
             return None
+        # trafilatura does the heavy lifting of main-content extraction
         extracted = trafilatura.extract(
             r.text,
             include_comments=False,
@@ -271,9 +332,17 @@ def fetch_article(url: str) -> dict | None:
 
 
 def expand_links_for_items(items: list[dict]) -> None:
-    """For each item, populate an 'articles' list of fetched article contents."""
+    """Mutates each item in place, adding an 'articles' list with fetched content.
+
+    Only runs for X tweets. Non-X sources (podcasts, forums, github, blogs, HN,
+    mev-defi) already contain their own long-form content in the description;
+    pre-fetching every link they mention would explode the prompt size for
+    no benefit. Those items pass through with an empty articles list."""
     url_to_items: dict[str, list[dict]] = {}
     for it in items:
+        it["articles"] = []
+        if it.get("category") != "x-twitter":
+            continue
         count = 0
         for raw_url in it["urls"]:
             if count >= LINK_MAX_PER_TWEET:
@@ -287,7 +356,6 @@ def expand_links_for_items(items: list[dict]) -> None:
                 continue
             url_to_items.setdefault(raw_url, []).append(it)
             count += 1
-        it["articles"] = []
 
     if not url_to_items:
         log("  no external URLs to expand")
@@ -310,90 +378,125 @@ def expand_links_for_items(items: list[dict]) -> None:
     log(f"  fetched {fetched_ok}/{len(url_to_items)} articles")
 
 
-# --- prompt construction ----------------------------------------------------
+# --- summarization ----------------------------------------------------------
 
 def build_prompt(items: list[dict]) -> str:
-    blocks: list[str] = []
-    for i, it in enumerate(items, 1):
-        text = it["text"].strip()
-        is_rt = text.startswith("RT @") or text.startswith("RT ")
-        rt_flag = " [RT]" if is_rt else ""
-        header = f"[{i}] {it['author']}{rt_flag} · list={it['feed']} · {it['published']}"
-        parts = [header, text, f"tweet_link: {it['link']}"]
-        for art in it.get("articles", []):
-            art_block = (
-                f"    └── LINKED ARTICLE ({art['host']})\n"
-                f"        title: {art['title']}\n"
-                f"        url:   {art['url']}\n"
-                f"        excerpt: {art['text']}"
-            )
-            parts.append(art_block)
-        blocks.append("\n".join(parts))
-    tweets_block = "\n\n".join(blocks)
+    # Group items by category in the prompt so Claude sees source context
+    items_by_cat: dict[str, list[dict]] = {}
+    for it in items:
+        cat = it.get("category", "x-twitter")
+        items_by_cat.setdefault(cat, []).append(it)
+
+    category_blocks: list[str] = []
+    global_idx = 0
+    for cat in CATEGORY_ORDER:
+        cat_items = items_by_cat.get(cat, [])
+        if not cat_items:
+            continue
+        label = CATEGORY_LABELS.get(cat, cat)
+        lines = [f"\n### {label} ({len(cat_items)} items)\n"]
+        for it in cat_items:
+            global_idx += 1
+            text = it["text"].strip()
+            # Per-category header format
+            if cat == "x-twitter":
+                is_rt = text.startswith("RT @") or text.startswith("RT ")
+                rt_flag = " [RT]" if is_rt else ""
+                header = f"[{global_idx}] {it['author']}{rt_flag} · list={it['feed']} · {it['published']}"
+            elif cat == "podcast":
+                header = f"[{global_idx}] {it['feed']} · EPISODE · {it['published']}"
+            elif cat == "forum":
+                header = f"[{global_idx}] {it['feed']} · THREAD by {it['author']} · {it['published']}"
+            elif cat == "github":
+                header = f"[{global_idx}] {it['feed']} · {it['author']} · {it['published']}"
+            elif cat == "ai-news":
+                header = f"[{global_idx}] {it['feed']} · POST · {it['published']}"
+            elif cat == "hn":
+                header = f"[{global_idx}] HN · {it.get('title','(no title)')} · {it['published']}"
+            elif cat == "mev-defi":
+                header = f"[{global_idx}] {it['feed']} · {it['author']} · {it['published']}"
+            else:
+                header = f"[{global_idx}] {it['feed']} · {it['author']} · {it['published']}"
+
+            parts = [header, text, f"link: {it['link']}"]
+            for art in it.get("articles", []):
+                art_block = (
+                    f"    └── LINKED ARTICLE ({art['host']})\n"
+                    f"        title: {art['title']}\n"
+                    f"        url:   {art['url']}\n"
+                    f"        excerpt: {art['text']}"
+                )
+                parts.append(art_block)
+            lines.append("\n".join(parts))
+        category_blocks.append("\n\n".join(lines))
+
+    all_content_block = "\n\n".join(category_blocks)
 
     feed_names = ", ".join(f["name"] for f in FEEDS)
-
-    sections_cfg = CONFIG.get("sections", {})
-    mandatory = sections_cfg.get("mandatory", ["Ethereum", "Solana", "AI"])
-    optional = sections_cfg.get("optional", ["Bitcoin"])
-    exclusions = sections_cfg.get("exclusions", [
-        "politics, elections, politicians, culture war, ideology",
-        "price speculation, TA charts, 'wen moon'",
-        "personal drama, Twitter fights",
-    ])
-
-    mandatory_block = "\n".join(
-        f"{i+1}. `## {name}`" for i, name in enumerate(mandatory)
+    category_counts = ", ".join(
+        f"{len(items_by_cat.get(c, []))} {c}" for c in CATEGORY_ORDER if items_by_cat.get(c)
     )
-    optional_block = ", ".join(f"`## {name}`" for name in optional) if optional else "(none)"
-    exclusions_block = "\n".join(f"- {e}" for e in exclusions)
 
-    return f"""You are producing a signal-driven digest of recent tweets from these Twitter Lists: {feed_names}. The reader does NOT want to visit x.com. Your job is to tell them WHAT HAPPENED and WHAT IS BEING DISCUSSED in the last window — not to list individual tweets.
+    return f"""You are producing a signal-driven multi-source digest for a crypto/AI researcher. They do NOT want to visit x.com, read dozens of podcast show notes, skim five governance forums, watch GitHub release feeds, or scan Hacker News themselves. Your job is to synthesize WHAT HAPPENED and WHAT IS BEING DISCUSSED across all sources, grounded in real external links.
 
-## Core framing: events over tweets
+## Input sources ({category_counts})
 
-- Focus on EVENTS and DISCUSSIONS, not individual accounts. Your unit of output is "a thing that happened or is being talked about", not "@someone tweeted X".
-- Consolidate across the feed: if 5 accounts are all discussing the same protocol launch, that becomes ONE bullet with the underlying news, not 5 bullets.
-- Only break out an individual tweet as its own bullet if it's an original, highly substantive take from a credible voice publishing a novel analysis or announcement directly. Reactions, memes, and vague takes are NOT substantive.
+You are being given material from SEVEN kinds of sources, clearly labelled in the content block below:
+
+1. **X TWEETS** — curated X/Twitter Lists. Mostly truncated retweets and short takes. Low signal per item, high volume.
+2. **PODCAST EPISODES** — show notes from podcasts the reader doesn't have time to listen to. For each episode you MUST decide: (a) summarize the 2-3 key ideas in the description, (b) flag explicitly whether it's worth actually listening to — "skip", "skim", or "listen" — with one line of why.
+3. **FORUM THREADS** — Ethereum Magicians, ethresear.ch, and DAO governance forums (Uniswap, Optimism, Arbitrum). High-signal technical + governance discussions. Include substantive ones in the relevant section.
+4. **GITHUB ACTIVITY** — commits on EIP repos, releases on geth/reth/foundry/agave. Filter noise; surface meaningful releases and new EIP proposals.
+5. **AI INDUSTRY NEWS** — OpenAI, Google, HuggingFace, Latent Space. Frontier model releases, research papers, product launches. Goes in the AI section.
+6. **HACKER NEWS TOP** — frontpage. Use for AI/ML/dev tooling signal that intersects with the reader's interests. Ignore unrelated trending topics.
+7. **MEV & DeFi RESEARCH** — Flashbots writings, Flashbots collective forum. Technical posts about MEV, blockspace economics, DeFi primitives.
+
+## Core framing: events over individual items
+
+- Focus on EVENTS and DISCUSSIONS, not individual posts or accounts. Your unit of output is "a thing that happened or is being talked about", not "@someone tweeted X".
+- Cross-source consolidation is the whole point: if an event appears in tweets AND a GitHub release AND a forum thread AND a podcast episode — that is ONE bullet with all sources cited, not four bullets. The more sources confirm it, the higher signal.
+- Only break out an individual item as its own bullet if it's original and substantive — a novel analysis, announcement, release, or research result with concrete content.
 - Scale volume to substance: a quiet window gets a short digest. Don't pad.
 
 ## Use WebSearch and WebFetch to find the real stories
 
-You have WebSearch and WebFetch tools available. Most tweets are truncated retweets or short references to news without links — search to find the actual source. **Use approximately {WEB_SEARCH_BUDGET_HINT} searches for a full-size batch**, more for large batches, fewer for small ones. Err on the side of searching more, not less.
+You have WebSearch and WebFetch tools. Most tweets are truncated retweets without links — search to find the actual source. **Use approximately {WEB_SEARCH_BUDGET_HINT} searches for a full-size batch**, more for large batches. There is no per-search fee.
 
 Search WHEN:
-- A tweet references a protocol launch, governance vote, hack, fundraise, partnership, release, or data point without a link → find the underlying announcement / news article / blog post / GitHub release
-- Multiple tweets reference the same event → ONE search, consolidate
+- A tweet / forum post / HN title references a launch, vote, hack, fundraise, partnership, release, paper, or data point without a link → find the underlying source
+- Multiple items reference the same event → ONE search, consolidate
 - An unfamiliar project or term needs a sentence of context → quick search
 - A stat is claimed without a source → verify and link the data source
-- You're not sure if an event is real or important → search to verify before dismissing
 
 Do NOT search for:
 - Memes, banter, vibes, reactions with no specific claim
-- Anything already covered by a LINKED ARTICLE provided inline
+- Anything already covered by a LINKED ARTICLE or sufficient show notes / release description
 - Topics unrelated to your mandatory sections (waste of budget)
 
 ## Mandatory section structure
 
-Your digest MUST always include these sections in this order:
+Your digest MUST always include these three sections in this order:
 
-{mandatory_block}
+1. `## Ethereum` — ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling
+2. `## Solana` — SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps
+3. `## AI` — AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.
 
-Optionally include {optional_block} ONLY IF there is substantive content for it. If there is no content, OMIT the section entirely. Do not print an empty optional section header.
+Optionally include `## Bitcoin` ONLY IF there is substantive Bitcoin content (BTC core, ordinals, Lightning, ETF flows, regulatory news). **If there is no Bitcoin content, OMIT the section entirely. Do not print an empty Bitcoin header.**
 
-**Do not dismiss content too easily.** Before marking a mandatory section "nothing substantial", check that you have genuinely considered every tweet in the batch for that theme.
+**Do not dismiss content too easily.** Check across ALL source types before marking a section empty. Signals by section:
+- **Ethereum**: mentions of Base, Arbitrum, Optimism, Polygon, restaking, EigenLayer, LSTs, ETH staking, MEV, rollups, L2s, EIPs, Uniswap/Aave/Morpho/Pendle/Lido, ENS, Farcaster, Reth/Geth/Erigon, Foundry, Flashbots, any Ethereum governance thread, any ETH ecosystem forum post, any eip-* GitHub commit.
+- **Solana**: mentions of Jupiter, Phantom, Jito, Pump.fun, Helius, Metaplex, Firedancer/Agave releases, SIMD proposals, SOL ETFs, Solana Mobile, any SOL ecosystem app.
+- **AI**: mentions of Claude, GPT, Gemini, LLaMA, Anthropic, OpenAI, Google DeepMind, Meta AI, xAI, agents, RAG, MCP, HuggingFace releases, arxiv papers, model launches, inference cost / latency, training runs, GPU supply, AI safety, interpretability, autoresearch, any AI-adjacent HN story with enough signal.
 
-**Minimum depth when content exists**: if a section has ANY relevant content in the batch, produce at least 2 substantive bullets.
+**Minimum depth when content exists**: if a section has ANY relevant content in the batch, produce **at least 2 substantive bullets**. Don't stop at 1.
 
-**Empty mandatory sections**: write exactly this single line under the header, nothing else: `_Nothing substantial this window._`
+**Empty sections (Ethereum/Solana/AI only)**: write exactly this single line under the header, nothing else: `_Nothing substantial this window._`
 
 ## Hard exclusions
 
-Drop content matching any of these categories entirely — do not mention, do not search for:
-
-{exclusions_block}
-
-If a tweet mixes an excluded topic with a substantive on-topic fact (e.g., "the president's crypto EO"), keep the substantive fact and drop the excluded framing.
+- **NO POLITICS**. Drop any tweet about elections, politicians, government policy debates, geopolitical conflict, culture war, or ideology. If a tweet is half-crypto half-politics (e.g., "the president's crypto EO"), keep the crypto fact and drop the political framing. If a tweet is purely political, drop it entirely — do not mention it, do not search for it.
+- No crypto price speculation, TA charts, or "wen moon" content unless it's a major macro shift with a concrete catalyst.
+- No personal drama, beef, or Twitter fights unless they're about a protocol's technical direction.
 
 ## Output format — PLAIN MARKDOWN
 
@@ -408,20 +511,52 @@ Output ONLY these markdown elements:
 
 **Link requirement**: every substantive bullet MUST end with at least one `[label](url)` link to an external source. No exceptions.
 
-**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## {mandatory[0]}`. Anything before that will be stripped and discarded.
+**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## Ethereum`. Anything before that will be stripped and discarded.
 
-**NO tweet-number references.** Never write "(tweet 11)" or "tweet #5" or "item 3" or any numeric reference to the input list. The tweet numbering in the input is internal scaffolding — the reader will never see it. Refer to the account (@handle) or the topic instead.
+**NO item-number references.** Never write "(tweet 11)", "item 3", "post #5", or any numeric reference to the input scaffolding. The bracketed numbers on each item are internal — the reader will never see them. Refer to the account, the podcast name, the repo, or the topic instead.
 
-## Tweets ({len(items)})
+Each bullet should read as a self-contained mini-update: what, why it matters, source link. Example style:
 
-{tweets_block}
+```
+- **Monad Foundation** launches validator device subsidy program covering ~$3K of signing laptop costs, available to anyone running ≥3 months of mainnet validation. Designed to accelerate solo-validator decentralization ahead of Monad mainnet Q2. [Announcement](https://blog.monad.xyz/device-subsidy)
+```
+
+## Podcast section — special handling
+
+Inside whichever section a podcast episode thematically belongs (Ethereum / Solana / AI / Bitcoin), include an additional line under the bullet that explicitly rates it:
+
+```
+- **a16z crypto podcast** with Paul Frambot covers how DeFi lending protocols like Morpho model risk, isolate collateral, and handle liquidations differently than Aave. Useful mental model if you're building on top of lending primitives. [Episode](https://...)
+  Worth listening: **LISTEN** — substantive technical walkthrough of lending protocol design from a builder.
+```
+
+The "Worth listening" label must be exactly one of: **SKIP**, **SKIM**, or **LISTEN**. One line of justification. The reader will use this to decide whether to actually play the episode.
+
+- **SKIP**: episode is off-topic, vibes, or covers well-known ground. Don't play it.
+- **SKIM**: read the show notes, maybe play at 2x, maybe jump to timestamps. Worth awareness but not full attention.
+- **LISTEN**: original substantive content (research, novel take, high-quality guest, new data). Play it properly.
+
+REMEMBER: first output characters must be `## Ethereum`. No preamble, no meta-commentary, no "I'll search".
+
+## Source material ({len(items)} items)
+
+{all_content_block}
 """
 
 
-# --- summarization ----------------------------------------------------------
+def _extract_text(resp) -> str:
+    """Concatenate all text blocks in the response, skipping tool_use blocks."""
+    parts = []
+    for block in resp.content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            parts.append(block.text)
+    return "".join(parts).strip()
+
 
 def _strip_preamble(markdown: str) -> str:
-    """Drop anything before the first `## ` heading."""
+    """Drop any preamble before the first `## ` heading. Haiku sometimes
+    ignores the 'no preamble' instruction and leaks meta-commentary."""
     idx = markdown.find("## ")
     if idx > 0:
         return markdown[idx:].strip()
@@ -436,6 +571,8 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     without an API web_search add-on.
     """
     prompt = build_prompt(items)
+
+    # Persist the prompt for debugging / reproducibility
     (BASE_DIR / "last-prompt.md").write_text(prompt)
 
     start = datetime.now()
@@ -455,7 +592,9 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
             timeout=CLAUDE_CLI_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"claude -p timed out after {CLAUDE_CLI_TIMEOUT}s")
+        raise RuntimeError(
+            f"claude -p timed out after {CLAUDE_CLI_TIMEOUT}s"
+        )
 
     duration = (datetime.now() - start).total_seconds()
 
@@ -474,49 +613,159 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     return output, stats
 
 
-# --- email body (plain markdown) --------------------------------------------
+# --- HTML brief rendering ---------------------------------------------------
 
-def render_email_body(claude_markdown: str, items: list[dict], stats: dict) -> str:
+def render_brief_html(claude_markdown: str, items: list[dict], stats: dict) -> str:
+    """Render a readable HTML brief from Claude's markdown output.
+
+    Uses the `markdown` library to convert to HTML, then wraps in a clean,
+    typography-focused template. Light background, system fonts, generous
+    whitespace. Designed to be opened in a browser from a local file URL.
+    """
     now = datetime.now()
-    header_date = now.strftime("%A %b %-d, %Y · %-I:%M %p %Z").strip(" ·")
-    feed_names = ", ".join(f["name"] for f in FEEDS)
-    article_count = sum(len(it.get("articles", [])) for it in items)
+    header_date = now.strftime("%A, %B %-d, %Y · %-I:%M %p").strip(" ·")
 
-    header = (
-        f"# Twitter Digest — {header_date}\n"
-        f"\n"
-        f"{len(items)} tweets across {len(FEEDS)} lists: {feed_names}\n"
-        f"{article_count} linked articles pre-expanded\n"
-        f"\n"
-        f"---\n"
-        f"\n"
+    sources_by_cat: dict[str, int] = {}
+    for it in items:
+        sources_by_cat[it.get("category", "?")] = sources_by_cat.get(it.get("category", "?"), 0) + 1
+    source_chips_html = "".join(
+        f'<span style="display:inline-block;padding:3px 10px;margin:2px 4px 2px 0;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:999px;font-size:11px;color:#475569;font-weight:500;">{v}&nbsp;{k}</span>'
+        for k, v in sources_by_cat.items()
     )
 
-    footer = (
-        f"\n\n---\n"
-        f"\n"
-        f"_Generated by digest.py · model: {MODEL} via claude -p · "
-        f"{stats.get('duration_seconds', 0)}s_\n"
+    body_html = md_lib.markdown(
+        claude_markdown.strip(),
+        extensions=["extra", "sane_lists", "smarty"],
     )
 
-    return header + claude_markdown.strip() + footer
+    # Inline styles so Gmail/other clients render properly
+    def inline(tag: str, style: str, html: str) -> str:
+        return re.sub(rf"<{tag}>", f'<{tag} style="{style}">', html)
+
+    body_html = inline("h2", (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:20px;font-weight:700;color:#0f172a;"
+        "margin:40px 0 14px 0;padding:0 0 8px 0;"
+        "border-bottom:2px solid #e2e8f0;letter-spacing:-0.01em;"
+    ), body_html)
+    body_html = inline("h3", (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:16px;font-weight:600;color:#334155;"
+        "margin:24px 0 10px 0;"
+    ), body_html)
+    body_html = inline("p", (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:15px;line-height:1.65;color:#1e293b;"
+        "margin:10px 0;"
+    ), body_html)
+    body_html = inline("ul", (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:15px;line-height:1.65;color:#1e293b;"
+        "margin:12px 0 18px 0;padding-left:22px;"
+    ), body_html)
+    body_html = inline("li", (
+        "margin:12px 0;color:#1e293b;"
+    ), body_html)
+    body_html = inline("strong", (
+        "color:#0f172a;font-weight:700;"
+    ), body_html)
+    body_html = inline("em", (
+        "color:#64748b;font-style:italic;"
+    ), body_html)
+    body_html = inline("blockquote", (
+        "margin:14px 0;padding:10px 16px;"
+        "border-left:3px solid #94a3b8;"
+        "background:#f8fafc;color:#475569;font-style:italic;"
+    ), body_html)
+    body_html = re.sub(
+        r'<a href="',
+        '<a style="color:#2563eb;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:2px;" href="',
+        body_html,
+    )
+    body_html = re.sub(
+        r'<hr\s*/?>',
+        '<hr style="border:none;border-top:1px solid #e2e8f0;margin:32px 0;"/>',
+        body_html,
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Research Brief — {header_date}</title>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;">
+<div style="max-width:720px;margin:0 auto;padding:32px 24px 48px 24px;background:#ffffff;">
+
+<div style="padding-bottom:20px;border-bottom:3px solid #0f172a;margin-bottom:24px;">
+<div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;letter-spacing:0.12em;text-transform:uppercase;color:#64748b;font-weight:600;">Research Brief</div>
+<div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:26px;font-weight:700;color:#0f172a;margin-top:6px;letter-spacing:-0.02em;">{header_date}</div>
+<div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;color:#64748b;margin-top:12px;line-height:1.5;">
+{len(items)} items across {len(FEEDS)} sources<br>
+<span style="display:inline-block;margin-top:6px;">{source_chips_html}</span>
+</div>
+</div>
+
+<div>
+{body_html}
+</div>
+
+<div style="margin-top:48px;padding-top:20px;border-top:1px solid #e2e8f0;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:12px;color:#94a3b8;line-height:1.5;">
+Generated by digest.py &middot; model: {MODEL} via claude&nbsp;-p &middot; {stats.get('duration_seconds', 0)}s
+</div>
+
+</div>
+</body>
+</html>
+"""
 
 
-# --- email ------------------------------------------------------------------
+# --- local file output + notification ---------------------------------------
 
-def send_email(subject: str, body: str, gmail_password: str) -> None:
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(EMAIL_FROM, gmail_password)
-        s.send_message(msg)
+def write_brief_to_disk(html: str, stats: dict, item_count: int) -> Path:
+    """Write the HTML brief to a timestamped archive file and update the
+    latest-brief.html pointer. Returns the path to the archive file."""
+    BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    archive_path = BRIEFS_DIR / f"{now:%Y-%m-%d_%H-%M}.html"
+    archive_path.write_text(html)
+    # latest-brief.html always points at the newest run. We write a full copy
+    # instead of a symlink so `open latest-brief.html` works even after the
+    # archive is moved or deleted.
+    LATEST_BRIEF.write_text(html)
+    return archive_path
+
+
+def notify_macos(title: str, subtitle: str, message: str) -> None:
+    """Display a macOS notification bubble via osascript. Silent failure if
+    notifications aren't available (e.g., running under launchd on a locked
+    screen)."""
+    if not SHOW_NOTIFICATION:
+        return
+    try:
+        # Escape double-quotes for the AppleScript string
+        def esc(s: str) -> str:
+            return s.replace('"', '\\"')
+        script = (
+            f'display notification "{esc(message)}" '
+            f'with title "{esc(title)}" '
+            f'subtitle "{esc(subtitle)}" '
+            f'sound name "Glass"'
+        )
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass  # notification is best-effort
 
 
 # --- main -------------------------------------------------------------------
 
 def main() -> int:
+    BASE_DIR.mkdir(exist_ok=True)
     log("=" * 56)
     log(f"digest run start · {len(FEEDS)} feed(s)")
 
@@ -526,10 +775,12 @@ def main() -> int:
 
     all_items = fetch_all_feeds()
     new_items = [it for it in all_items if it["id"] not in seen]
+    # Dedup by id across feeds (same tweet in two lists)
     by_id: dict[str, dict] = {}
     for it in new_items:
         by_id.setdefault(it["id"], it)
     new_items = list(by_id.values())
+    # Chronological, oldest first
     new_items.sort(key=lambda i: i.get("published", ""))
     log(f"{len(new_items)} new items after dedup")
 
@@ -538,20 +789,15 @@ def main() -> int:
     if limit_env and limit_env.isdigit():
         limit = int(limit_env)
         if 0 < limit < len(new_items):
+            # Take the most recent N (keep latest context)
             new_items = new_items[-limit:]
             log(f"TW_LIMIT={limit} applied — processing most recent {limit} items")
 
     if not new_items:
-        log("no new items — no email sent")
+        log("no new items — nothing to brief")
         return 0
 
     expand_links_for_items(new_items)
-
-    try:
-        gmail_password = keychain_get(GMAIL_KEYCHAIN_SERVICE)
-    except RuntimeError as e:
-        log(f"ERROR reading keychain: {e}")
-        return 2
 
     try:
         claude_markdown, stats = summarize(new_items)
@@ -563,21 +809,24 @@ def main() -> int:
         log(f"ERROR calling claude -p: {e}")
         return 3
 
-    body = render_email_body(claude_markdown, new_items, stats)
-    (BASE_DIR / "last-digest.md").write_text(body)
+    html = render_brief_html(claude_markdown, new_items, stats)
+    archive_path = write_brief_to_disk(html, stats, len(new_items))
+    log(f"brief written: {archive_path}")
+    log(f"latest pointer:  {LATEST_BRIEF}")
 
-    now = datetime.now()
-    subject = (
-        f"[tw digest] {len(new_items)} · "
-        f"{now.strftime('%a %b ')}{now.day} {now.strftime('%-I:%M %p')}"
+    # macOS notification so you know a fresh brief is ready
+    sources_by_cat: dict[str, int] = {}
+    for it in new_items:
+        c = it.get("category", "?")
+        sources_by_cat[c] = sources_by_cat.get(c, 0) + 1
+    top_cats = ", ".join(
+        f"{v} {k}" for k, v in sorted(sources_by_cat.items(), key=lambda x: -x[1])[:3]
     )
-
-    try:
-        send_email(subject, body, gmail_password)
-        log(f"email sent: {subject}")
-    except Exception as e:
-        log(f"ERROR sending email: {e}")
-        return 4
+    notify_macos(
+        title="Research Brief ready",
+        subtitle=f"{len(new_items)} items across {len(FEEDS)} sources",
+        message=f"Top categories: {top_cats}",
+    )
 
     state["seen_ids"].extend(it["id"] for it in new_items)
     save_state(state)

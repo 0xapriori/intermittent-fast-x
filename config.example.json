@@ -1,25 +1,47 @@
 {
-  "feeds": [
+  "sources": [
     {
-      "name": "Ethereum",
-      "url": "https://rss.app/feeds/YOUR_FEED_ID_HERE.xml"
+      "name": "Example X List",
+      "url": "https://rss.app/feeds/YOUR_FEED_ID.xml",
+      "category": "x-twitter"
     },
     {
-      "name": "Solana",
-      "url": "https://rss.app/feeds/YOUR_FEED_ID_HERE.xml"
+      "name": "Ethereum Magicians",
+      "url": "https://ethereum-magicians.org/latest.rss",
+      "category": "forum",
+      "max_items": 15
     },
     {
-      "name": "AI",
-      "url": "https://rss.app/feeds/YOUR_FEED_ID_HERE.xml"
+      "name": "Hacker News Top",
+      "url": "https://hnrss.org/frontpage?count=30",
+      "category": "hn",
+      "max_items": 30
+    },
+    {
+      "name": "ethereum/EIPs",
+      "url": "https://github.com/ethereum/EIPs/commits.atom",
+      "category": "github",
+      "max_items": 15
+    },
+    {
+      "name": "HuggingFace Blog",
+      "url": "https://huggingface.co/blog/feed.xml",
+      "category": "ai-news",
+      "max_items": 10
+    },
+    {
+      "name": "Flashbots Writings",
+      "url": "https://writings.flashbots.net/rss.xml",
+      "category": "mev-defi",
+      "max_items": 10
+    },
+    {
+      "name": "Dwarkesh Podcast",
+      "url": "https://api.substack.com/feed/podcast/69345.rss",
+      "category": "podcast",
+      "max_items": 4
     }
   ],
-
-  "email": {
-    "from": "your-sender@gmail.com",
-    "to": "your-recipient@example.com"
-  },
-
-  "gmail_keychain_service": "twitter-digest-gmail",
 
   "model": "claude-opus-4-6",
 
@@ -33,8 +55,14 @@
     ]
   },
 
+  "output": {
+    "briefs_dir": "~/twitter-digest/briefs",
+    "latest_pointer": "~/twitter-digest/latest-brief.html",
+    "show_macos_notification": true
+  },
+
   "web_search_budget_hint": 10,
-  "claude_cli_timeout_seconds": 900,
+  "claude_cli_timeout_seconds": 1800,
   "max_seen_ids": 2000,
   "link_fetch_timeout_seconds": 7,
   "link_max_content_chars": 3500,

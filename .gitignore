@@ -3,8 +3,11 @@ config.json
 
 # Runtime state
 state.json
-last-digest.md
 last-prompt.md
+
+# Generated briefs (never commit personal-research output)
+briefs/
+latest-brief.html
 
 # Logs
 logs/
