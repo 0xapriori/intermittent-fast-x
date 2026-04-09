@@ -21,7 +21,7 @@ import subprocess
 import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 from pathlib import Path
 
@@ -448,7 +448,7 @@ You are being given material from SEVEN kinds of sources, clearly labelled in th
 3. **FORUM THREADS** — Ethereum Magicians, ethresear.ch, and DAO governance forums (Uniswap, Optimism, Arbitrum). High-signal technical + governance discussions. Include substantive ones in the relevant section.
 4. **GITHUB ACTIVITY** — commits on EIP repos, releases on geth/reth/foundry/agave. Filter noise; surface meaningful releases and new EIP proposals.
 5. **AI INDUSTRY NEWS** — OpenAI, Google, HuggingFace, Latent Space. Frontier model releases, research papers, product launches. Goes in the AI section.
-6. **HACKER NEWS TOP** — frontpage. Use for AI/ML/dev tooling signal that intersects with the reader's interests. Ignore unrelated trending topics.
+6. **HACKER NEWS TOP** — the current HN frontpage. Feed this into the dedicated `## Hacker News` section (see below). Coverage is broad, not limited to AI/crypto — include any substantive story a technical reader would care about.
 7. **MEV & DeFi RESEARCH** — Flashbots writings, Flashbots collective forum. Technical posts about MEV, blockspace economics, DeFi primitives.
 
 ## Core framing: events over individual items
@@ -471,15 +471,27 @@ Search WHEN:
 Do NOT search for:
 - Memes, banter, vibes, reactions with no specific claim
 - Anything already covered by a LINKED ARTICLE or sufficient show notes / release description
-- Topics unrelated to your mandatory sections (waste of budget)
+- HN stories where the title + description already give you enough context (search only for the ones that genuinely need it)
 
 ## Mandatory section structure
 
-Your digest MUST always include these three sections in this order:
+Your digest MUST always include these four sections in this order:
 
 1. `## Ethereum` — ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling
 2. `## Solana` — SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps
 3. `## AI` — AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.
+4. `## Hacker News` — The top stories trending on HN frontpage right now, across any topic (not just AI/crypto). See the "Hacker News section requirements" below for specifics.
+
+## Hacker News section requirements
+
+The Hacker News input category contains the current HN frontpage (top stories by points/comments). You MUST summarize them in a dedicated `## Hacker News` section with the following rules:
+
+- **4-8 bullets**, one per meaningful story. Pick the highest-signal items — prioritize technical releases, research, novel tools, substantive writing, industry news. Skip pure rage-bait, off-topic memes, and low-effort link farms.
+- **Scope is NOT limited to AI/crypto.** HN covers the entire tech world. Include anything a curious technical reader would find substantive: new programming languages, OS/kernel news, hardware launches, science papers, infrastructure research, novel products, postmortems, long-form essays, legal/policy news affecting tech, etc.
+- Each bullet format: `- **<Story title or topic>**: 1-2 sentences of summary/context. [HN discussion](url) · [Source](url)`
+- If the HN story links to an external article, link BOTH the HN comments page (usually https://news.ycombinator.com/item?id=...) AND the source URL, so the reader can choose discussion or article.
+- If the top story is already covered in the Ethereum/Solana/AI sections (e.g., a major Anthropic release is #1 on HN AND in the AI section), skip it here to avoid duplication. Note at the end: "(Top AI stories covered in the AI section above.)"
+- **Do NOT dismiss this section with "nothing substantial".** HN frontpage always has content; the job is to find the 4-8 most interesting items and explain them.
 
 Optionally include `## Bitcoin` ONLY IF there is substantive Bitcoin content (BTC core, ordinals, Lightning, ETF flows, regulatory news). **If there is no Bitcoin content, OMIT the section entirely. Do not print an empty Bitcoin header.**
 
@@ -611,6 +623,68 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
         "stderr_chars": len(result.stderr or ""),
     }
     return output, stats
+
+
+# --- morning prepend: yesterday's Claude Code journal ----------------------
+
+JOURNAL_DIR = Path.home() / "claude-code-journal"
+
+
+def _find_recent_journal_file() -> Path | None:
+    """Return the most relevant recent journal file.
+    Prefers yesterday's dated file, falls back to today's (in case the
+    23:59 journal fired late), then any file modified in the last 48h."""
+    if not JOURNAL_DIR.exists():
+        return None
+    now = datetime.now()
+    yesterday_path = JOURNAL_DIR / f"{(now - timedelta(days=1)):%Y-%m-%d}.md"
+    today_path = JOURNAL_DIR / f"{now:%Y-%m-%d}.md"
+    if yesterday_path.exists():
+        return yesterday_path
+    if today_path.exists():
+        return today_path
+    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+    candidates = [
+        (p.stat().st_mtime, p)
+        for p in JOURNAL_DIR.glob("*.md")
+        if date_pattern.match(p.name)
+        and p.stat().st_mtime > (now - timedelta(hours=48)).timestamp()
+    ]
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    return None
+
+
+def load_yesterdays_journal() -> str | None:
+    """Read the most relevant recent Claude Code journal entry and return
+    it as a markdown block ready to prepend to the morning brief."""
+    journal_file = _find_recent_journal_file()
+    if journal_file is None:
+        log("  no recent journal file found — skipping")
+        return None
+    try:
+        raw = journal_file.read_text()
+    except OSError as e:
+        log(f"  failed to read journal file {journal_file}: {e}")
+        return None
+    log(f"  using journal file: {journal_file.name}")
+    parts = raw.split("\n---\n", 1)
+    if len(parts) < 2:
+        log("  journal file has unexpected format — skipping")
+        return None
+    body = parts[1].strip()
+    meta_markers = ("\n---\n\n## Session Metadata", "\n---\n## Session Metadata")
+    for marker in meta_markers:
+        idx = body.find(marker)
+        if idx >= 0:
+            body = body[:idx].strip()
+            break
+    if not body or len(body) < 20:
+        return None
+    body = re.sub(r"^## ", "### ", body, flags=re.MULTILINE)
+    yesterday_display = (datetime.now() - timedelta(days=1)).strftime("%A, %B %-d")
+    return f"## Yesterday's Claude Code Work — {yesterday_display}\n\n{body}"
 
 
 # --- HTML brief rendering ---------------------------------------------------
@@ -808,6 +882,23 @@ def main() -> int:
     except Exception as e:
         log(f"ERROR calling claude -p: {e}")
         return 3
+
+    # Morning run (7am) prepends yesterday's Claude Code journal summary.
+    # Set FORCE_MORNING_PREPEND=1 to test outside the 7am slot.
+    is_morning_run = (
+        datetime.now().hour == 7
+        or os.environ.get("FORCE_MORNING_PREPEND", "").lower() in ("1", "true", "yes")
+    )
+    if is_morning_run:
+        log("morning run: looking for yesterday's journal")
+        yesterday_summary = load_yesterdays_journal()
+        if yesterday_summary:
+            claude_markdown = (
+                yesterday_summary.strip()
+                + "\n\n---\n\n"
+                + claude_markdown.strip()
+            )
+            log(f"  prepended yesterday's journal ({len(yesterday_summary)} chars)")
 
     html = render_brief_html(claude_markdown, new_items, stats)
     archive_path = write_brief_to_disk(html, stats, len(new_items))
