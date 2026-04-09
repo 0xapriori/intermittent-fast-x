@@ -51,13 +51,12 @@ def _load_config() -> dict:
 
 
 CONFIG = _load_config()
+HOME = BASE_DIR  # back-compat for any remaining references
 
 # Sources come from config.json. Each entry: {name, url, category, max_items?}.
-# Categories drive content normalization and how the prompt groups items.
-# All feeds are parsed with feedparser regardless of category.
 FEEDS: list[dict] = CONFIG.get("sources") or []
 if not FEEDS:
-    raise SystemExit("config.json has no 'sources' list — see config.example.json")
+    raise SystemExit("config.json has no 'sources' list")
 
 # Per-category content truncation (chars) — non-tweet items can have long
 # descriptions; truncate to keep the prompt manageable.
@@ -87,16 +86,17 @@ CATEGORY_ORDER = ["x-twitter", "podcast", "forum", "github", "ai-news", "hn", "m
 
 MODEL: str = CONFIG.get("model", "claude-opus-4-6")  # via Max through `claude -p`
 
-# Local output paths. Resolve ~ if the user put a home-relative path in config.
+
 def _resolve_path(p: str) -> Path:
     return Path(os.path.expanduser(p)).resolve()
 
-_output = CONFIG.get("output", {})
-BRIEFS_DIR = _resolve_path(_output.get("briefs_dir", str(BASE_DIR / "briefs")))
+
+_output_cfg = CONFIG.get("output", {})
+BRIEFS_DIR = _resolve_path(_output_cfg.get("briefs_dir", str(BASE_DIR / "briefs")))
 LATEST_BRIEF = _resolve_path(
-    _output.get("latest_pointer", str(BASE_DIR / "latest-brief.html"))
+    _output_cfg.get("latest_pointer", str(BASE_DIR / "latest-brief.html"))
 )
-SHOW_NOTIFICATION: bool = bool(_output.get("show_macos_notification", True))
+SHOW_NOTIFICATION: bool = bool(_output_cfg.get("show_macos_notification", True))
 
 MAX_SEEN_IDS: int = CONFIG.get("max_seen_ids", 2000)
 CLAUDE_CLI_TIMEOUT: int = CONFIG.get("claude_cli_timeout_seconds", 1800)
@@ -107,6 +107,32 @@ LINK_FETCH_TIMEOUT: int = CONFIG.get("link_fetch_timeout_seconds", 7)
 LINK_MAX_CONTENT_CHARS: int = CONFIG.get("link_max_content_chars", 3500)
 LINK_MAX_PER_TWEET: int = CONFIG.get("link_max_per_tweet", 3)
 LINK_CONCURRENCY: int = CONFIG.get("link_concurrency", 10)
+
+# Section config — user-overridable via CONFIG["sections"]
+_sections_cfg = CONFIG.get("sections", {})
+MANDATORY_SECTIONS: list[str] = _sections_cfg.get(
+    "mandatory", ["Ethereum", "Solana", "AI", "Hacker News"]
+)
+OPTIONAL_SECTIONS: list[str] = _sections_cfg.get("optional", ["Bitcoin"])
+EXCLUSIONS: list[str] = _sections_cfg.get(
+    "exclusions",
+    [
+        "politics, elections, politicians, government policy debates, "
+        "geopolitical conflict, culture war, ideology.",
+        "crypto price speculation, TA charts, or 'wen moon' content "
+        "unless it's a major macro shift with a concrete catalyst.",
+        "personal drama, beef, or Twitter fights unless they're about "
+        "a protocol's technical direction.",
+    ],
+)
+
+SECTION_GUIDANCE: dict[str, str] = {
+    "Ethereum":    "ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling",
+    "Solana":      "SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps",
+    "AI":          "AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.",
+    "Hacker News": 'The top stories trending on HN frontpage right now, across any topic (not just AI/crypto). See the "Hacker News section requirements" below for specifics.',
+    "Bitcoin":     "BTC core, ordinals, Lightning, ETF flows, regulatory news.",
+}
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -223,56 +249,21 @@ def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
     return urls
 
 
-FEED_FETCH_TIMEOUT: int = CONFIG.get("feed_fetch_timeout_seconds", 30)
-
-# Section config: user-overridable via CONFIG["sections"]. Defaults chosen
-# to match the previously-hardcoded sections for backward compatibility.
-_sections_cfg = CONFIG.get("sections", {})
-MANDATORY_SECTIONS: list[str] = _sections_cfg.get(
-    "mandatory", ["Ethereum", "Solana", "AI", "Hacker News"]
-)
-OPTIONAL_SECTIONS: list[str] = _sections_cfg.get("optional", ["Bitcoin"])
-EXCLUSIONS: list[str] = _sections_cfg.get(
-    "exclusions",
-    [
-        "politics, elections, politicians, government policy debates, "
-        "geopolitical conflict, culture war, ideology. If a tweet is "
-        "half-crypto half-politics (e.g., \"the president's crypto EO\"), "
-        "keep the crypto fact and drop the political framing. If a tweet is "
-        "purely political, drop it entirely — do not mention it, do not search for it.",
-        "crypto price speculation, TA charts, or \"wen moon\" content "
-        "unless it's a major macro shift with a concrete catalyst.",
-        "personal drama, beef, or Twitter fights unless they're about a "
-        "protocol's technical direction.",
-    ],
-)
-
-# Per-section one-line guidance for the "Mandatory section structure" block
-# of the prompt. Unknown sections get the section name alone (no guidance);
-# users can add custom sections by editing this dict or extending via config.
-SECTION_GUIDANCE: dict[str, str] = {
-    "Ethereum":    "ETH core, L2s/rollups (Base, Arbitrum, Optimism, etc.), DeFi on ETH, restaking/LSTs, MEV, ETH-ecosystem apps and tooling",
-    "Solana":      "SOL core, Solana DeFi, memecoin dynamics, Phantom/Jito/Jupiter/Pump.fun, Solana ecosystem apps",
-    "AI":          "AI models, agents, Anthropic/OpenAI/Google/xAI/Meta, AI x crypto, ML infra, agentic commerce, AI tooling. This is the full AI industry, not just AI-crypto crossover.",
-    "Hacker News": 'The top stories trending on HN frontpage right now, across any topic (not just AI/crypto). See the "Hacker News section requirements" below for specifics.',
-    "Bitcoin":     "BTC core, ordinals, Lightning, ETF flows, regulatory news.",
-}
+FEED_FETCH_TIMEOUT = 30  # seconds — hard cap per feed, prevents single-feed hangs
 
 
 def _fetch_feed_bytes(url: str) -> bytes | None:
-    """Fetch a feed URL with a hard timeout, return raw bytes or raise.
+    """Fetch a feed URL with a hard timeout, return raw bytes or None on error.
 
     feedparser.parse() has no timeout parameter and will silently hang on
-    slow servers. Pre-fetching with requests.get(timeout=...) gives us a
-    guaranteed upper bound, then we hand the bytes to feedparser.
+    slow servers (we saw 15-minute gaps on individual feeds during the
+    April 9 outage). Pre-fetching with requests.get(timeout=...) gives us
+    a guaranteed upper bound, then we hand the bytes to feedparser.
     """
     try:
         r = requests.get(
             url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-            },
+            headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},
             timeout=FEED_FETCH_TIMEOUT,
             allow_redirects=True,
         )
@@ -280,6 +271,7 @@ def _fetch_feed_bytes(url: str) -> bytes | None:
             raise RuntimeError(f"HTTP {r.status_code}")
         return r.content
     except Exception as e:
+        # Re-raise with a short description so the caller can log it
         raise RuntimeError(str(e)[:200])
 
 
@@ -459,7 +451,7 @@ def expand_links_for_items(items: list[dict]) -> None:
 
 # --- summarization ----------------------------------------------------------
 
-def build_prompt(items: list[dict]) -> str:
+def build_prompt(items: list[dict], defillama_text: str = "") -> str:
     # Group items by category in the prompt so Claude sees source context
     items_by_cat: dict[str, list[dict]] = {}
     for it in items:
@@ -523,8 +515,6 @@ def build_prompt(items: list[dict]) -> str:
         for i, name in enumerate(MANDATORY_SECTIONS)
     )
 
-    # The Hacker News section has detailed requirements — only emit the
-    # requirements block if HN is actually in the mandatory list.
     if "Hacker News" in MANDATORY_SECTIONS:
         hn_requirements_block = """## Hacker News section requirements
 
@@ -555,8 +545,6 @@ The Hacker News input category contains the current HN frontpage (top stories by
         optional_section_clause = ""
 
     exclusions_block = "\n".join(f"- {e}" for e in EXCLUSIONS)
-
-    # First mandatory section name — used in the "first output characters" hint
     first_section = MANDATORY_SECTIONS[0] if MANDATORY_SECTIONS else "Ethereum"
 
     return f"""You are producing a signal-driven multi-source digest for a crypto/AI researcher. They do NOT want to visit x.com, read dozens of podcast show notes, skim five governance forums, watch GitHub release feeds, or scan Hacker News themselves. Your job is to synthesize WHAT HAPPENED and WHAT IS BEING DISCUSSED across all sources, grounded in real external links.
@@ -628,7 +616,7 @@ Output ONLY these markdown elements:
 
 **Link requirement**: every substantive bullet MUST end with at least one `[label](url)` link to an external source. No exceptions.
 
-**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## {first_section}`. Anything before that will be stripped and discarded.
+**NO preamble.** Do NOT write "Here's the digest" or "I'll search for..." or "Based on the tweets..." or ANY intro text. Your very first characters of output must be `## Ethereum`. Anything before that will be stripped and discarded.
 
 **NO item-number references.** Never write "(tweet 11)", "item 3", "post #5", or any numeric reference to the input scaffolding. The bracketed numbers on each item are internal — the reader will never see them. Refer to the account, the podcast name, the repo, or the topic instead.
 
@@ -654,6 +642,8 @@ The "Worth listening" label must be exactly one of: **SKIP**, **SKIM**, or **LIS
 - **LISTEN**: original substantive content (research, novel take, high-quality guest, new data). Play it properly.
 
 REMEMBER: first output characters must be `## {first_section}`. No preamble, no meta-commentary, no "I'll search".
+
+{defillama_text}
 
 ## Source material ({len(items)} items)
 
@@ -683,17 +673,17 @@ def _strip_preamble(markdown: str) -> str:
 def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> subprocess.CompletedProcess:
     """Run a subprocess with a REAL timeout that actually kills the child.
 
-    subprocess.run(timeout=...) has a known failure mode where it can hang
-    indefinitely inside communicate() if the child process doesn't return
-    promptly. We observed this in production: a `claude -p` child hung for
-    3+ hours on a stalled network call and subprocess.run never raised.
+    subprocess.run(timeout=...) has a known failure mode on macOS where it
+    can hang indefinitely inside communicate() if the child process doesn't
+    return promptly — the timeout exception never fires and the parent stays
+    blocked. We observed this in production: a claude -p child hung for 3+
+    hours on a stalled network call and subprocess.run never raised.
 
     This helper uses Popen + a watchdog poll loop. We escalate:
       1. At timeout: SIGTERM (graceful)
       2. 5 seconds later if still alive: SIGKILL (hard)
     We always return OR raise RuntimeError — never hang forever.
     """
-    import time as _time
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -701,6 +691,7 @@ def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> su
         stderr=subprocess.PIPE,
         text=True,
     )
+    # Write the prompt to stdin and close it, so the child can start consuming.
     try:
         proc.stdin.write(prompt)
         proc.stdin.close()
@@ -715,17 +706,20 @@ def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> su
     while True:
         rc = proc.poll()
         if rc is not None:
+            # Child exited — drain remaining output
             stdout = proc.stdout.read() or ""
             stderr = proc.stderr.read() or ""
             return subprocess.CompletedProcess(
                 args=cmd, returncode=rc, stdout=stdout, stderr=stderr,
             )
         if datetime.now().timestamp() >= deadline:
+            # Graceful kill first
             log(f"  claude -p exceeded {timeout_s}s — sending SIGTERM")
             try:
                 proc.terminate()
             except ProcessLookupError:
                 pass
+            # Wait up to 5s for graceful exit
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -735,6 +729,7 @@ def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> su
                 except ProcessLookupError:
                     pass
                 proc.wait(timeout=5)
+            # Try to drain whatever output was produced
             try:
                 stdout = proc.stdout.read() or ""
                 stderr = proc.stderr.read() or ""
@@ -744,18 +739,21 @@ def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> su
                 f"claude -p killed by watchdog after {timeout_s}s "
                 f"(last stderr: {stderr[:300]!r})"
             )
-        _time.sleep(poll_interval)
+        __import__("time").sleep(poll_interval)
 
 
-def summarize(items: list[dict]) -> tuple[str, dict]:
+def summarize(items: list[dict], defillama_text: str = "") -> tuple[str, dict]:
     """Invoke `claude -p` (Claude Code non-interactive) to summarize.
 
     Uses the authenticated Max subscription via OAuth. Grants the session
     WebSearch and WebFetch tools so Claude can research tweet topics
-    without an API web_search add-on.
+    without an API web_search add-on. Optionally includes a text version
+    of the DefiLlama snapshot so the narrative can reference live numbers.
     """
-    prompt = build_prompt(items)
-    (BASE_DIR / "last-prompt.md").write_text(prompt)
+    prompt = build_prompt(items, defillama_text=defillama_text)
+
+    # Persist the prompt for debugging / reproducibility
+    (HOME / "last-prompt.md").write_text(prompt)
 
     start = datetime.now()
     cmd = [
@@ -765,7 +763,8 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     ]
     log(f"  invoking: {' '.join(cmd)}")
 
-    # Watchdog helper: guarantees return OR raise within timeout, never hangs.
+    # Use the watchdog helper — guarantees we either get output or an error
+    # within CLAUDE_CLI_TIMEOUT seconds, never hangs forever.
     result = _run_claude_with_watchdog(cmd, prompt, CLAUDE_CLI_TIMEOUT)
 
     duration = (datetime.now() - start).total_seconds()
@@ -785,73 +784,12 @@ def summarize(items: list[dict]) -> tuple[str, dict]:
     return output, stats
 
 
-# --- morning prepend: yesterday's Claude Code journal ----------------------
-
-JOURNAL_DIR = Path.home() / "claude-code-journal"
-
-
-def _find_recent_journal_file() -> Path | None:
-    """Return the most relevant recent journal file.
-    Prefers yesterday's dated file, falls back to today's (in case the
-    23:59 journal fired late), then any file modified in the last 48h."""
-    if not JOURNAL_DIR.exists():
-        return None
-    now = datetime.now()
-    yesterday_path = JOURNAL_DIR / f"{(now - timedelta(days=1)):%Y-%m-%d}.md"
-    today_path = JOURNAL_DIR / f"{now:%Y-%m-%d}.md"
-    if yesterday_path.exists():
-        return yesterday_path
-    if today_path.exists():
-        return today_path
-    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
-    candidates = [
-        (p.stat().st_mtime, p)
-        for p in JOURNAL_DIR.glob("*.md")
-        if date_pattern.match(p.name)
-        and p.stat().st_mtime > (now - timedelta(hours=48)).timestamp()
-    ]
-    if candidates:
-        candidates.sort(reverse=True)
-        return candidates[0][1]
-    return None
-
-
-def load_yesterdays_journal() -> str | None:
-    """Read the most relevant recent Claude Code journal entry and return
-    it as a markdown block ready to prepend to the morning brief."""
-    journal_file = _find_recent_journal_file()
-    if journal_file is None:
-        log("  no recent journal file found — skipping")
-        return None
-    try:
-        raw = journal_file.read_text()
-    except OSError as e:
-        log(f"  failed to read journal file {journal_file}: {e}")
-        return None
-    log(f"  using journal file: {journal_file.name}")
-    parts = raw.split("\n---\n", 1)
-    if len(parts) < 2:
-        log("  journal file has unexpected format — skipping")
-        return None
-    body = parts[1].strip()
-    meta_markers = ("\n---\n\n## Session Metadata", "\n---\n## Session Metadata")
-    for marker in meta_markers:
-        idx = body.find(marker)
-        if idx >= 0:
-            body = body[:idx].strip()
-            break
-    if not body or len(body) < 20:
-        return None
-    body = re.sub(r"^## ", "### ", body, flags=re.MULTILINE)
-    yesterday_display = (datetime.now() - timedelta(days=1)).strftime("%A, %B %-d")
-    return f"## Yesterday's Claude Code Work — {yesterday_display}\n\n{body}"
-
-
 # --- HTML brief rendering ---------------------------------------------------
 
 def _failed_feeds_html() -> str:
-    """Small HTML block listing any feeds that failed this run.
-    Empty string if nothing failed."""
+    """Build a small HTML block listing any feeds that failed this run.
+    Returns empty string if nothing failed — section is only shown when
+    there's something to warn about."""
     if not FAILED_FEEDS:
         return ""
     items_html = "".join(
@@ -868,7 +806,7 @@ def _failed_feeds_html() -> str:
     )
 
 
-def render_brief_html(claude_markdown: str, items: list[dict], stats: dict) -> str:
+def render_brief_html(claude_markdown: str, items: list[dict], stats: dict, defillama_snapshot: dict | None = None) -> str:
     """Render a readable HTML brief from Claude's markdown output.
 
     Uses the `markdown` library to convert to HTML, then wraps in a clean,
@@ -962,6 +900,8 @@ def render_brief_html(claude_markdown: str, items: list[dict], stats: dict) -> s
 
 {_failed_feeds_html()}
 
+{render_defillama_html(defillama_snapshot or {})}
+
 <div>
 {body_html}
 </div>
@@ -974,6 +914,455 @@ Generated by digest.py &middot; model: {MODEL} via claude&nbsp;-p &middot; {stat
 </body>
 </html>
 """
+
+
+# --- DefiLlama snapshot -----------------------------------------------------
+
+DEFILLAMA_TIMEOUT = 15  # seconds per endpoint
+DEFILLAMA_TOP_N = 8     # rows per table
+
+
+def fetch_defillama_snapshot() -> dict:
+    """Fetch a compact DeFi analytics snapshot from DefiLlama's free public
+    API. Covers DEX volumes, lending TVL, stablecoin supply, chain TVL.
+
+    Returns a dict with up to four keys: dexs, lending, stablecoins, chains.
+    Per-endpoint failures log and continue — one broken endpoint doesn't
+    block the others. Returns an empty dict on total failure."""
+    snapshot: dict = {}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+
+    # 1. DEX volumes
+    try:
+        r = requests.get(
+            "https://api.llama.fi/overview/dexs?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
+            timeout=DEFILLAMA_TIMEOUT,
+            headers=headers,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            protos = [p for p in (d.get("protocols") or []) if (p.get("total24h") or 0) > 0]
+            protos.sort(key=lambda p: p.get("total24h", 0) or 0, reverse=True)
+            snapshot["dexs"] = {
+                "total_24h": d.get("total24h"),
+                "total_7d": d.get("total7d"),
+                "change_1d": d.get("change_1d"),
+                "change_7d": d.get("change_7d"),
+                "top": [
+                    {
+                        "name": p.get("name"),
+                        "volume_24h": p.get("total24h"),
+                        "change_1d": p.get("change_1d"),
+                    }
+                    for p in protos[:DEFILLAMA_TOP_N]
+                ],
+            }
+    except Exception as e:
+        log(f"  defillama dexs failed: {e}")
+
+    # 2. Lending TVL (via /protocols filtered by Lending category)
+    try:
+        r = requests.get(
+            "https://api.llama.fi/protocols",
+            timeout=DEFILLAMA_TIMEOUT,
+            headers=headers,
+        )
+        if r.status_code == 200:
+            all_protos = r.json()
+            lending = [p for p in all_protos if p.get("category") == "Lending"]
+            lending.sort(key=lambda p: p.get("tvl", 0) or 0, reverse=True)
+            snapshot["lending"] = {
+                "total_tvl": sum((p.get("tvl", 0) or 0) for p in lending),
+                "top": [
+                    {
+                        "name": p.get("name"),
+                        "tvl": p.get("tvl"),
+                        "change_1d": p.get("change_1d"),
+                        "change_7d": p.get("change_7d"),
+                    }
+                    for p in lending[:DEFILLAMA_TOP_N]
+                ],
+            }
+    except Exception as e:
+        log(f"  defillama lending failed: {e}")
+
+    # 3. Stablecoins (proxy for "payments")
+    try:
+        r = requests.get(
+            "https://stablecoins.llama.fi/stablecoins?includePrices=false",
+            timeout=DEFILLAMA_TIMEOUT,
+            headers=headers,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            coins = data.get("peggedAssets", [])
+
+            def _circ(c):
+                cm = c.get("circulating") or {}
+                return cm.get("peggedUSD", 0) or 0
+
+            def _prev(c):
+                cm = c.get("circulatingPrevDay") or {}
+                return cm.get("peggedUSD", 0) or 0
+
+            coins.sort(key=_circ, reverse=True)
+            snapshot["stablecoins"] = {
+                "total_supply": sum(_circ(c) for c in coins),
+                "top": [
+                    {
+                        "symbol": c.get("symbol"),
+                        "name": c.get("name"),
+                        "supply": _circ(c),
+                        "delta_1d_usd": _circ(c) - _prev(c),
+                    }
+                    for c in coins[:DEFILLAMA_TOP_N]
+                ],
+            }
+    except Exception as e:
+        log(f"  defillama stablecoins failed: {e}")
+
+    # 4. Chains (cross-chain TVL distribution)
+    try:
+        r = requests.get(
+            "https://api.llama.fi/chains",
+            timeout=DEFILLAMA_TIMEOUT,
+            headers=headers,
+        )
+        if r.status_code == 200:
+            chains = r.json()
+            chains.sort(key=lambda c: c.get("tvl", 0) or 0, reverse=True)
+            snapshot["chains"] = {
+                "total_tvl": sum((c.get("tvl", 0) or 0) for c in chains),
+                "top": [
+                    {
+                        "name": c.get("name"),
+                        "tvl": c.get("tvl"),
+                        "token": c.get("tokenSymbol", ""),
+                    }
+                    for c in chains[:10]
+                ],
+            }
+    except Exception as e:
+        log(f"  defillama chains failed: {e}")
+
+    return snapshot
+
+
+def _fmt_usd(n) -> str:
+    if n is None:
+        return "—"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(n) >= 1e9:
+        return f"${n/1e9:.2f}B"
+    if abs(n) >= 1e6:
+        return f"${n/1e6:.1f}M"
+    if abs(n) >= 1e3:
+        return f"${n/1e3:.0f}K"
+    return f"${n:,.0f}"
+
+
+def _fmt_pct(p) -> str:
+    if p is None:
+        return "—"
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "—"
+    color = "#15803d" if p >= 0 else "#b91c1c"
+    sign = "+" if p >= 0 else ""
+    return f'<span style="color:{color};font-weight:600;">{sign}{p:.1f}%</span>'
+
+
+def render_defillama_html(snapshot: dict) -> str:
+    """Render the DefiLlama snapshot as four clean HTML tables."""
+    if not snapshot:
+        return ""
+
+    H2 = (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:20px;font-weight:700;color:#0f172a;"
+        "margin:40px 0 14px 0;padding:0 0 8px 0;"
+        "border-bottom:2px solid #e2e8f0;letter-spacing:-0.01em;"
+    )
+    CAPTION = (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:13px;color:#475569;margin:18px 0 6px 0;font-weight:600;"
+    )
+    TABLE = (
+        "width:100%;border-collapse:collapse;"
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:13px;margin:4px 0 14px 0;"
+    )
+    TH = (
+        "text-align:left;padding:8px 12px 6px 12px;"
+        "font-weight:700;color:#64748b;font-size:11px;"
+        "text-transform:uppercase;letter-spacing:0.06em;"
+        "border-bottom:2px solid #e2e8f0;"
+    )
+    TH_R = TH + "text-align:right;"
+    TD = "padding:7px 12px;border-bottom:1px solid #f1f5f9;color:#1e293b;"
+    TD_R = TD + "text-align:right;font-variant-numeric:tabular-nums;"
+    TD_NAME = TD + "font-weight:600;color:#0f172a;"
+
+    parts: list[str] = []
+    parts.append(
+        f'<h2 style="{H2}">DeFi Snapshot '
+        '<span style="font-size:12px;font-weight:500;color:#64748b;">(DefiLlama · live)</span>'
+        '</h2>'
+    )
+
+    # --- DEX volumes ---
+    if "dexs" in snapshot:
+        d = snapshot["dexs"]
+        caption = (
+            f'Top DEXs by 24h Volume &middot; Total <strong>{_fmt_usd(d["total_24h"])}</strong> '
+            f'&middot; 1d {_fmt_pct(d["change_1d"])} &middot; 7d {_fmt_pct(d["change_7d"])}'
+        )
+        parts.append(f'<div style="{CAPTION}">{caption}</div>')
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{p["name"]}</td>'
+            f'<td style="{TD_R}">{_fmt_usd(p["volume_24h"])}</td>'
+            f'<td style="{TD_R}">{_fmt_pct(p["change_1d"])}</td></tr>'
+            for p in d["top"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">DEX</th>'
+            f'<th style="{TH_R}">24h Volume</th>'
+            f'<th style="{TH_R}">1d Δ</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    # --- Lending TVL ---
+    if "lending" in snapshot:
+        l = snapshot["lending"]
+        caption = (
+            f'Top Lending Protocols by TVL &middot; '
+            f'Category total <strong>{_fmt_usd(l["total_tvl"])}</strong>'
+        )
+        parts.append(f'<div style="{CAPTION}">{caption}</div>')
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{p["name"]}</td>'
+            f'<td style="{TD_R}">{_fmt_usd(p["tvl"])}</td>'
+            f'<td style="{TD_R}">{_fmt_pct(p["change_1d"])}</td>'
+            f'<td style="{TD_R}">{_fmt_pct(p["change_7d"])}</td></tr>'
+            for p in l["top"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Protocol</th>'
+            f'<th style="{TH_R}">TVL</th>'
+            f'<th style="{TH_R}">1d Δ</th>'
+            f'<th style="{TH_R}">7d Δ</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    # --- Stablecoins ---
+    if "stablecoins" in snapshot:
+        s = snapshot["stablecoins"]
+        caption = (
+            f'Top Stablecoins by Circulating Supply &middot; '
+            f'Total market <strong>{_fmt_usd(s["total_supply"])}</strong>'
+        )
+        parts.append(f'<div style="{CAPTION}">{caption}</div>')
+
+        def _fmt_signed_usd(n):
+            if n is None:
+                return "—"
+            color = "#15803d" if n >= 0 else "#b91c1c"
+            sign = "+" if n >= 0 else "−"
+            return f'<span style="color:{color};font-weight:600;">{sign}{_fmt_usd(abs(n))}</span>'
+
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{c["symbol"]}</td>'
+            f'<td style="{TD}">{c["name"]}</td>'
+            f'<td style="{TD_R}">{_fmt_usd(c["supply"])}</td>'
+            f'<td style="{TD_R}">{_fmt_signed_usd(c["delta_1d_usd"])}</td></tr>'
+            for c in s["top"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Symbol</th>'
+            f'<th style="{TH}">Name</th>'
+            f'<th style="{TH_R}">Supply</th>'
+            f'<th style="{TH_R}">1d Δ (USD)</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    # --- Cross-chain TVL ---
+    if "chains" in snapshot:
+        c = snapshot["chains"]
+        caption = (
+            f'Cross-chain TVL &middot; '
+            f'Aggregate <strong>{_fmt_usd(c["total_tvl"])}</strong>'
+        )
+        parts.append(f'<div style="{CAPTION}">{caption}</div>')
+        total = c["total_tvl"] or 1
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{p["name"]}</td>'
+            f'<td style="{TD}">{p["token"] or "—"}</td>'
+            f'<td style="{TD_R}">{_fmt_usd(p["tvl"])}</td>'
+            f'<td style="{TD_R}">{(p["tvl"] or 0) / total * 100:.1f}%</td></tr>'
+            for p in c["top"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Chain</th>'
+            f'<th style="{TH}">Native</th>'
+            f'<th style="{TH_R}">TVL</th>'
+            f'<th style="{TH_R}">Share</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    return "".join(parts)
+
+
+def render_defillama_for_prompt(snapshot: dict) -> str:
+    """Compact text version of the DefiLlama snapshot, suitable for injecting
+    into the Claude prompt so the narrative can reference the numbers."""
+    if not snapshot:
+        return ""
+    lines = ["## DeFi Metrics (from DefiLlama — fresh at run time)\n"]
+
+    if "dexs" in snapshot:
+        d = snapshot["dexs"]
+        lines.append(
+            f"**DEX 24h volume**: {_fmt_usd(d['total_24h'])} "
+            f"(1d {d['change_1d']:+.1f}% · 7d {d['change_7d']:+.1f}%)"
+            if d.get("change_1d") is not None and d.get("change_7d") is not None
+            else f"**DEX 24h volume**: {_fmt_usd(d['total_24h'])}"
+        )
+        tops = [f"{p['name']} {_fmt_usd(p['volume_24h'])}" for p in d["top"][:5]]
+        lines.append(f"  Top: {', '.join(tops)}")
+
+    if "lending" in snapshot:
+        l = snapshot["lending"]
+        lines.append(f"**Lending TVL (top lending protocols)**: {_fmt_usd(l['total_tvl'])}")
+        tops = [f"{p['name']} {_fmt_usd(p['tvl'])}" for p in l["top"][:5]]
+        lines.append(f"  Top: {', '.join(tops)}")
+
+    if "stablecoins" in snapshot:
+        s = snapshot["stablecoins"]
+        lines.append(f"**Stablecoin total market**: {_fmt_usd(s['total_supply'])}")
+        tops = [f"{c['symbol']} {_fmt_usd(c['supply'])}" for c in s["top"][:5]]
+        lines.append(f"  Top: {', '.join(tops)}")
+
+    if "chains" in snapshot:
+        c = snapshot["chains"]
+        lines.append(f"**Cross-chain TVL (aggregate)**: {_fmt_usd(c['total_tvl'])}")
+        tops = [f"{p['name']} {_fmt_usd(p['tvl'])}" for p in c["top"][:6]]
+        lines.append(f"  Top: {', '.join(tops)}")
+
+    lines.append(
+        "\n_These are authoritative live numbers. Feel free to reference "
+        "them in your synthesis where relevant (e.g., citing DEX volume "
+        "trends, lending protocol changes, stablecoin flows). Do NOT "
+        "duplicate the table itself — the reader sees it separately._"
+    )
+    return "\n".join(lines)
+
+
+# --- morning prepend: yesterday's Claude Code journal ----------------------
+
+JOURNAL_DIR = Path.home() / "claude-code-journal"
+
+
+def _find_recent_journal_file() -> Path | None:
+    """Return the path to the most relevant recent journal file.
+
+    Preference order:
+      1. Yesterday's dated file (the normal case when the journal ran on
+         schedule at 23:59 last night).
+      2. Today's dated file (handles the late-fire case where the Mac was
+         asleep at 23:59 and launchd didn't run the journal until this
+         morning — the file ends up dated for today but it's still the
+         coverage the brief wants).
+      3. Any journal file modified in the last 48 hours (last-ditch fallback
+         if the dated naming drifted for any reason).
+    Returns None if nothing fits.
+    """
+    if not JOURNAL_DIR.exists():
+        return None
+    now = datetime.now()
+    yesterday_path = JOURNAL_DIR / f"{(now - timedelta(days=1)):%Y-%m-%d}.md"
+    today_path = JOURNAL_DIR / f"{now:%Y-%m-%d}.md"
+    if yesterday_path.exists():
+        return yesterday_path
+    if today_path.exists():
+        return today_path
+    # Last-ditch: most recently modified dated journal file in the last 48h.
+    # The filename must match YYYY-MM-DD.md exactly — this is how we avoid
+    # picking up debug artifacts like last-prompt.md that live in the same dir.
+    date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+    candidates = [
+        (p.stat().st_mtime, p)
+        for p in JOURNAL_DIR.glob("*.md")
+        if date_pattern.match(p.name)
+        and p.stat().st_mtime > (now - timedelta(hours=48)).timestamp()
+    ]
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    return None
+
+
+def load_yesterdays_journal() -> str | None:
+    """Read the most relevant recent Claude Code journal entry (if any) and
+    return it as a markdown block ready to prepend to today's morning brief.
+
+    The full journal entry has a frontmatter header + body + session metadata
+    footer. We keep only the body (Overview, Projects, Loose Ends, Tomorrow's
+    Considerations), demote its inner `##` headers to `###` so they nest
+    under a new `## Yesterday's Claude Code Work` wrapper heading.
+    """
+    journal_file = _find_recent_journal_file()
+    if journal_file is None:
+        log("  no recent journal file found — skipping")
+        return None
+
+    try:
+        raw = journal_file.read_text()
+    except OSError as e:
+        log(f"  failed to read journal file {journal_file}: {e}")
+        return None
+
+    log(f"  using journal file: {journal_file.name}")
+
+    # Split on the first horizontal rule after the frontmatter. The journal
+    # format is:
+    #   # Claude Code Journal — ...
+    #   _Generated: ..._
+    #   ---
+    #   <body>
+    #   ---
+    #   ## Session Metadata
+    #   ...
+    parts = raw.split("\n---\n", 1)
+    if len(parts) < 2:
+        log("  journal file has unexpected format — skipping")
+        return None
+    body = parts[1].strip()
+
+    # Strip trailing session metadata block if present
+    meta_markers = ("\n---\n\n## Session Metadata", "\n---\n## Session Metadata")
+    for marker in meta_markers:
+        idx = body.find(marker)
+        if idx >= 0:
+            body = body[:idx].strip()
+            break
+
+    if not body or len(body) < 20:
+        return None
+
+    # Demote inner `## ` headers to `### ` so they nest under our wrapper
+    body = re.sub(r"^## ", "### ", body, flags=re.MULTILINE)
+
+    # Pretty header that references yesterday's date for context
+    yesterday_display = (datetime.now() - timedelta(days=1)).strftime("%A, %B %-d")
+    return f"## Yesterday's Claude Code Work — {yesterday_display}\n\n{body}"
 
 
 # --- local file output + notification ---------------------------------------
@@ -1020,7 +1409,7 @@ def notify_macos(title: str, subtitle: str, message: str) -> None:
 # --- main -------------------------------------------------------------------
 
 def main() -> int:
-    BASE_DIR.mkdir(exist_ok=True)
+    HOME.mkdir(exist_ok=True)
     log("=" * 56)
     log(f"digest run start · {len(FEEDS)} feed(s)")
 
@@ -1054,8 +1443,19 @@ def main() -> int:
 
     expand_links_for_items(new_items)
 
+    # Fetch DefiLlama snapshot in parallel-ish with whatever comes next.
+    # This is a quick I/O-bound call (~1-3 seconds total for 4 endpoints),
+    # so we just do it inline before the claude -p call.
+    log("fetching DefiLlama snapshot")
+    defillama_snapshot = fetch_defillama_snapshot()
+    log(
+        f"  defillama sections: "
+        f"{', '.join(defillama_snapshot.keys()) if defillama_snapshot else '(none)'}"
+    )
+    defillama_text = render_defillama_for_prompt(defillama_snapshot)
+
     try:
-        claude_markdown, stats = summarize(new_items)
+        claude_markdown, stats = summarize(new_items, defillama_text=defillama_text)
         log(
             f"summary generated ({len(claude_markdown)} chars) · "
             f"duration={stats['duration_seconds']}s"
@@ -1073,7 +1473,9 @@ def main() -> int:
     # "Morning" = any run fired between 5am and noon local time. This covers
     # both the on-schedule 7am run AND late-fire cases where the Mac was
     # asleep at 7am and launchd finally fired at e.g. 9am when you opened
-    # the lid. Set FORCE_MORNING_PREPEND=1 to force outside this window.
+    # the lid. Only the first morning run of the day includes the prepend
+    # (we don't want the 2pm run to also prepend).
+    # Set FORCE_MORNING_PREPEND=1 to force it outside this window.
     now_hour = datetime.now().hour
     is_morning_run = (
         (5 <= now_hour < 12)
@@ -1090,7 +1492,9 @@ def main() -> int:
             )
             log(f"  prepended yesterday's journal ({len(yesterday_summary)} chars)")
 
-    html = render_brief_html(claude_markdown, new_items, stats)
+    html = render_brief_html(
+        claude_markdown, new_items, stats, defillama_snapshot=defillama_snapshot
+    )
     archive_path = write_brief_to_disk(html, stats, len(new_items))
     log(f"brief written: {archive_path}")
     log(f"latest pointer:  {LATEST_BRIEF}")
@@ -1103,6 +1507,8 @@ def main() -> int:
     top_cats = ", ".join(
         f"{v} {k}" for k, v in sorted(sources_by_cat.items(), key=lambda x: -x[1])[:3]
     )
+    # Include feed-failure count in notification subtitle so user sees it
+    # immediately, before even opening the brief.
     subtitle = f"{len(new_items)} items across {len(FEEDS)} sources"
     if FAILED_FEEDS:
         subtitle += f" · {len(FAILED_FEEDS)} feeds failed"
