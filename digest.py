@@ -21,7 +21,7 @@ import subprocess
 import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 
@@ -282,6 +282,116 @@ def extract_urls(tweet_text: str, tweet_description_html: str) -> list[str]:
 
 
 FEED_FETCH_TIMEOUT = 30  # seconds — hard cap per feed, prevents single-feed hangs
+FORUM_ACTIVITY_HOURS = CONFIG.get("forum_activity_hours", 48)  # only keep forum topics bumped within this window
+
+
+def _fetch_discourse_json(rss_url: str) -> dict | None:
+    """Given a Discourse RSS URL like https://ethresear.ch/latest.rss,
+    fetch the corresponding JSON endpoint and return the parsed result.
+    Returns None on any failure (caller falls back to RSS)."""
+    if ".rss" not in rss_url:
+        return None
+    json_url = rss_url.replace(".rss", ".json")
+    try:
+        r = requests.get(
+            json_url,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=FEED_FETCH_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _parse_discourse_topics_as_items(
+    data: dict,
+    feed_name: str,
+    category: str,
+    max_items: int,
+    source_url: str,
+    activity_hours: int,
+) -> tuple[list[dict], int]:
+    """Convert a Discourse /latest.json response into our standard item
+    dicts, filtering to topics bumped within the last N hours so only
+    genuinely active discussions flow into the brief.
+
+    Returns (items, total_topics_considered).
+    """
+    topics = (data.get("topic_list") or {}).get("topics", [])
+    now = datetime.now(timezone.utc)
+
+    def _hours_ago(iso: str) -> float:
+        if not iso:
+            return 9999.0
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return (now - dt).total_seconds() / 3600
+        except Exception:
+            return 9999.0
+
+    fresh = [t for t in topics if _hours_ago(t.get("bumped_at", "")) <= activity_hours]
+    # Sort by most-recently-bumped first
+    fresh.sort(key=lambda t: t.get("bumped_at", ""), reverse=True)
+    fresh = fresh[:max_items]
+
+    # Derive the base URL from the source rss URL (strip "/latest.rss" etc.)
+    base = re.sub(r"/(latest|top|new|unread|hot)\.(rss|json).*$", "", source_url)
+    if not base:
+        base = source_url.rsplit("/", 1)[0]
+
+    items: list[dict] = []
+    for t in fresh:
+        slug = t.get("slug", "")
+        tid = t.get("id", 0)
+        if slug and tid:
+            link = f"{base}/t/{slug}/{tid}"
+        elif tid:
+            link = f"{base}/t/{tid}"
+        else:
+            continue
+
+        excerpt = (t.get("excerpt") or "").strip()
+        reply_count = t.get("reply_count", 0) or 0
+        posts_count = t.get("posts_count", 1) or 1
+        bumped_ago = _hours_ago(t.get("bumped_at", ""))
+        created_ago = _hours_ago(t.get("created_at", ""))
+        last_poster = t.get("last_poster_username", "") or "unknown"
+
+        # Tag the text with activity metadata so Claude knows what's
+        # actually fresh vs what's just bumped.
+        if bumped_ago < 1:
+            bump_str = f"bumped {int(bumped_ago * 60)}m ago"
+        else:
+            bump_str = f"bumped {bumped_ago:.1f}h ago"
+        if created_ago < 24:
+            create_str = "new post"
+        elif created_ago < 168:
+            create_str = f"posted {created_ago / 24:.1f}d ago"
+        else:
+            create_str = f"posted {created_ago / 24:.0f}d ago"
+
+        activity_prefix = (
+            f"[{bump_str}, {create_str}, {reply_count} replies, "
+            f"{posts_count} posts] "
+        )
+        text_body = activity_prefix + excerpt
+
+        items.append({
+            "id": f"discourse-{base}-{tid}",
+            "feed": feed_name,
+            "category": category,
+            "author": last_poster,
+            "title": t.get("title", ""),
+            "text": text_body[: CONTENT_MAX_CHARS_BY_CATEGORY.get(category, 1500)],
+            "description_html": excerpt,
+            "link": link,
+            "published": t.get("bumped_at", ""),
+            "urls": [],
+        })
+
+    return items, len(topics)
 
 
 def _fetch_feed_bytes(url: str) -> bytes | None:
@@ -321,8 +431,34 @@ def fetch_all_feeds() -> list[dict]:
         category = feed_cfg.get("category", "x-twitter")
         max_items = feed_cfg.get("max_items")
         name = feed_cfg["name"]
+        url = feed_cfg["url"]
+
+        # For forum-category feeds that look like Discourse, prefer the
+        # JSON endpoint + activity filter. This correctly surfaces old
+        # threads with new replies and skips old threads with no activity.
+        if category == "forum" and ".rss" in url:
+            data = _fetch_discourse_json(url)
+            if data:
+                items, total_scanned = _parse_discourse_topics_as_items(
+                    data,
+                    feed_name=name,
+                    category=category,
+                    max_items=max_items or 15,
+                    source_url=url,
+                    activity_hours=FORUM_ACTIVITY_HOURS,
+                )
+                all_items.extend(items)
+                log(
+                    f"  ✓ {name:28s} [{category:10s}] "
+                    f"{len(items)} active (of {total_scanned} topics, "
+                    f"bumped ≤{FORUM_ACTIVITY_HOURS}h)"
+                )
+                continue
+            # JSON fetch failed — fall through to RSS as before
+            log(f"  {name}: discourse JSON failed, falling back to RSS")
+
         try:
-            raw = _fetch_feed_bytes(feed_cfg["url"])
+            raw = _fetch_feed_bytes(url)
             parsed = feedparser.parse(raw)
             if parsed.bozo and not parsed.entries:
                 reason = f"parse failed ({parsed.bozo_exception})"
@@ -332,6 +468,7 @@ def fetch_all_feeds() -> list[dict]:
             entries = parsed.entries
             if max_items:
                 entries = entries[:max_items]
+            item_count = 0
             for entry in entries:
                 guid = entry.get("id") or entry.get("guid") or entry.get("link")
                 if not guid:
@@ -351,7 +488,8 @@ def fetch_all_feeds() -> list[dict]:
                     "published": entry.get("published", ""),
                     "urls": extract_urls(text, desc_html),
                 })
-            log(f"  ✓ {name:28s} [{category:10s}] {len(entries)} items")
+                item_count += 1
+            log(f"  ✓ {name:28s} [{category:10s}] {item_count} items")
         except Exception as e:
             reason = str(e)[:200]
             log(f"  ✗ {name:28s} [{category:10s}] {reason}")
@@ -894,7 +1032,13 @@ def _failed_feeds_html() -> str:
     )
 
 
-def render_brief_html(claude_markdown: str, items: list[dict], stats: dict, defillama_snapshot: dict | None = None) -> str:
+def render_brief_html(
+    claude_markdown: str,
+    items: list[dict],
+    stats: dict,
+    defillama_snapshot: dict | None = None,
+    mev_snapshot: dict | None = None,
+) -> str:
     """Render a readable HTML brief from Claude's markdown output.
 
     Uses the `markdown` library to convert to HTML, then wraps in a clean,
@@ -990,6 +1134,8 @@ def render_brief_html(claude_markdown: str, items: list[dict], stats: dict, defi
 
 {render_defillama_html(defillama_snapshot or {})}
 
+{render_mev_html(mev_snapshot or {})}
+
 <div>
 {body_html}
 </div>
@@ -1002,6 +1148,270 @@ Generated by digest.py &middot; model: {MODEL} via claude&nbsp;-p &middot; {stat
 </body>
 </html>
 """
+
+
+# --- MEV-Boost snapshot from relayscan.io ----------------------------------
+
+RELAYSCAN_URL = "https://relayscan.io/overview?t=24h"
+MEV_TIMEOUT = 15
+
+
+def _parse_relayscan_table(table_html: str, expected_cols: int) -> list[list[str]]:
+    """Parse a relayscan HTML5 table (no closing </td> or </th>) into rows."""
+    rows_raw = re.findall(
+        r"<tr[^>]*>(.*?)(?=<tr|</tbody>|</table>|$)", table_html, re.DOTALL
+    )
+    rows: list[list[str]] = []
+    for r in rows_raw:
+        cells = re.findall(
+            r"<td[^>]*>(.*?)(?=<t[dh]|</tr>|</table>|$)", r, re.DOTALL
+        )
+        if not cells:
+            continue
+        texts = []
+        for c in cells[:expected_cols]:
+            t = re.sub(r"<[^>]+>", "", c)
+            t = unescape(t)
+            t = re.sub(r"\s+", " ", t).strip()
+            texts.append(t)
+        if any(texts):
+            rows.append(texts)
+    return rows
+
+
+def fetch_mev_snapshot() -> dict:
+    """Fetch MEV-Boost stats from relayscan.io/overview (24h window) and
+    parse the three HTML tables into structured data:
+      - relays: market share (relay, payloads, percent)
+      - builders: block share (builder, blocks, percent)
+      - profits: builder profitability (builder, blocks, profit_eth, subsidy_eth)
+    Returns empty dict on any failure — the brief still renders without it."""
+    snapshot: dict = {}
+    try:
+        r = requests.get(
+            RELAYSCAN_URL,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+            timeout=MEV_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log(f"  relayscan status {r.status_code}")
+            return {}
+        html = r.text
+    except Exception as e:
+        log(f"  relayscan fetch failed: {e}")
+        return {}
+
+    tables = list(re.finditer(r"<table[^>]*>(.*?)</table>", html, re.DOTALL))
+    if len(tables) < 3:
+        log(f"  relayscan: expected 3 tables, got {len(tables)}")
+        return {}
+
+    # Table 1: Relay market share
+    try:
+        rows = _parse_relayscan_table(tables[0].group(1), 3)
+        snapshot["relays"] = [
+            {
+                "relay": row[0],
+                "payloads": row[1],
+                "percent": row[2],
+            }
+            for row in rows[:10]
+            if len(row) >= 3
+        ]
+    except Exception as e:
+        log(f"  relayscan relays parse failed: {e}")
+
+    # Table 2: Builder block share
+    try:
+        rows = _parse_relayscan_table(tables[1].group(1), 3)
+        snapshot["builders"] = [
+            {
+                "builder": row[0],
+                "blocks": row[1],
+                "percent": row[2],
+            }
+            for row in rows[:10]
+            if len(row) >= 3
+        ]
+    except Exception as e:
+        log(f"  relayscan builders parse failed: {e}")
+
+    # Table 3: Builder profit
+    try:
+        rows = _parse_relayscan_table(tables[2].group(1), 6)
+        snapshot["profits"] = [
+            {
+                "builder": row[0],
+                "blocks": row[1],
+                "blocks_profit": row[2],
+                "blocks_subsidy": row[3],
+                "profit_eth": row[4],
+                "subsidy_eth": row[5],
+            }
+            for row in rows[:8]
+            if len(row) >= 6
+        ]
+    except Exception as e:
+        log(f"  relayscan profit parse failed: {e}")
+
+    return snapshot
+
+
+def render_mev_html(snapshot: dict) -> str:
+    """Render the MEV snapshot as clean HTML tables, matching the
+    DefiLlama section's typography."""
+    if not snapshot:
+        return ""
+
+    H2 = (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:20px;font-weight:700;color:#0f172a;"
+        "margin:40px 0 14px 0;padding:0 0 8px 0;"
+        "border-bottom:2px solid #e2e8f0;letter-spacing:-0.01em;"
+    )
+    CAPTION = (
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:13px;color:#475569;margin:18px 0 6px 0;font-weight:600;"
+    )
+    TABLE = (
+        "width:100%;border-collapse:collapse;"
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif;"
+        "font-size:13px;margin:4px 0 14px 0;"
+    )
+    TH = (
+        "text-align:left;padding:8px 12px 6px 12px;"
+        "font-weight:700;color:#64748b;font-size:11px;"
+        "text-transform:uppercase;letter-spacing:0.06em;"
+        "border-bottom:2px solid #e2e8f0;"
+    )
+    TH_R = TH + "text-align:right;"
+    TD = "padding:7px 12px;border-bottom:1px solid #f1f5f9;color:#1e293b;"
+    TD_R = TD + "text-align:right;font-variant-numeric:tabular-nums;"
+    TD_NAME = TD + "font-weight:600;color:#0f172a;"
+
+    parts: list[str] = []
+    parts.append(
+        f'<h2 style="{H2}">MEV-Boost Activity '
+        '<span style="font-size:12px;font-weight:500;color:#64748b;">'
+        '(<a style="color:#2563eb;text-decoration:underline;" '
+        'href="https://relayscan.io/overview?t=24h">relayscan.io</a> · '
+        '<a style="color:#2563eb;text-decoration:underline;" '
+        'href="https://mevboost.pics">mevboost.pics</a> · 24h window)'
+        '</span>'
+        '</h2>'
+    )
+
+    # Relay market share
+    if snapshot.get("relays"):
+        parts.append(f'<div style="{CAPTION}">Relay Market Share (last 24h)</div>')
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{r["relay"]}</td>'
+            f'<td style="{TD_R}">{r["payloads"]}</td>'
+            f'<td style="{TD_R}">{r["percent"]}</td></tr>'
+            for r in snapshot["relays"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Relay</th>'
+            f'<th style="{TH_R}">Payloads</th>'
+            f'<th style="{TH_R}">Share</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    # Builder block share
+    if snapshot.get("builders"):
+        parts.append(f'<div style="{CAPTION}">Top Block Builders (last 24h)</div>')
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{b["builder"]}</td>'
+            f'<td style="{TD_R}">{b["blocks"]}</td>'
+            f'<td style="{TD_R}">{b["percent"]}</td></tr>'
+            for b in snapshot["builders"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Builder</th>'
+            f'<th style="{TH_R}">Blocks</th>'
+            f'<th style="{TH_R}">Share</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    # Builder profit
+    if snapshot.get("profits"):
+        parts.append(f'<div style="{CAPTION}">Builder Profitability (24h, ETH)</div>')
+        rows = "".join(
+            f'<tr><td style="{TD_NAME}">{p["builder"][:40]}</td>'
+            f'<td style="{TD_R}">{p["blocks"]}</td>'
+            f'<td style="{TD_R}">{p["profit_eth"]}</td>'
+            f'<td style="{TD_R}">{p["subsidy_eth"]}</td></tr>'
+            for p in snapshot["profits"]
+        )
+        parts.append(
+            f'<table style="{TABLE}">'
+            f'<thead><tr><th style="{TH}">Builder</th>'
+            f'<th style="{TH_R}">Blocks</th>'
+            f'<th style="{TH_R}">Profit</th>'
+            f'<th style="{TH_R}">Subsidy</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+
+    return "".join(parts)
+
+
+def render_mev_for_prompt(snapshot: dict) -> str:
+    """Compact text version of the MEV snapshot for the Claude prompt."""
+    if not snapshot:
+        return ""
+    lines = ["## MEV-Boost Activity (from relayscan.io, 24h window)\n"]
+    def _short_name(s: str) -> str:
+        """Pick a readable short label — use the first segment of the
+        domain name, or the first whitespace-delimited word for builder
+        names. Examples:
+          'relay.ultrasound.money'         -> 'ultrasound.money'
+          'bloxroute.max-profit.blxrbdn.com' -> 'bloxroute'
+          'Titan (titanbuilder.xyz)'       -> 'Titan'
+          'BuilderNet (Flashbots)'         -> 'BuilderNet (Flashbots)'
+        """
+        s = s.strip()
+        # Parenthetical form: "Name (domain)"
+        if " (" in s:
+            return s.split(" (", 1)[0] + (
+                f" ({s.split(' (', 1)[1].rstrip(')').split('.')[0]})"
+                if "(" in s else ""
+            )
+        # Domain form: strip everything after the second dot for readability
+        if s.count(".") >= 2 and " " not in s:
+            parts = s.split(".")
+            return ".".join(parts[1:]) if len(parts[0]) <= 6 else parts[0]
+        return s[:28]
+
+    if snapshot.get("relays"):
+        top = snapshot["relays"][:5]
+        lines.append("**Top relays**: " + " · ".join(
+            f"{_short_name(r['relay'])} {r['percent']}" for r in top
+        ))
+    if snapshot.get("builders"):
+        top = snapshot["builders"][:5]
+        lines.append("**Top builders**: " + " · ".join(
+            f"{_short_name(b['builder'])} {b['percent']}" for b in top
+        ))
+    if snapshot.get("profits"):
+        top = sorted(
+            snapshot["profits"],
+            key=lambda p: float(p.get("profit_eth", "0").replace(",", "") or "0"),
+            reverse=True,
+        )[:5]
+        lines.append(
+            "**Most profitable builders (24h)**: "
+            + " · ".join(
+                f"{_short_name(p['builder'])} {p['profit_eth']}Ξ" for p in top
+            )
+        )
+    lines.append(
+        "\n_These numbers are current as of the run time. "
+        "Reference them when relevant to MEV, relay censorship, "
+        "builder centralization, or block auction topics._"
+    )
+    return "\n".join(lines)
 
 
 # --- recent-brief history (topic-level dedup) ------------------------------
@@ -1794,6 +2204,18 @@ def main() -> int:
     )
     defillama_text = render_defillama_for_prompt(defillama_snapshot)
 
+    log("fetching MEV snapshot (relayscan.io)")
+    mev_snapshot = fetch_mev_snapshot()
+    if mev_snapshot:
+        log(
+            f"  mev: {len(mev_snapshot.get('relays',[]))} relays, "
+            f"{len(mev_snapshot.get('builders',[]))} builders, "
+            f"{len(mev_snapshot.get('profits',[]))} profit rows"
+        )
+    else:
+        log("  mev: no data")
+    mev_text = render_mev_for_prompt(mev_snapshot)
+
     # Load the last few briefs so Claude can avoid repeating stories it
     # already wrote about in the recent past.
     recent_briefs = load_recent_brief_context()
@@ -1802,10 +2224,13 @@ def main() -> int:
     else:
         log("no recent briefs to dedup against (first run or empty archive)")
 
+    # Combine the two onchain-data text blocks so Claude sees both
+    combined_data_text = "\n\n".join(x for x in [defillama_text, mev_text] if x)
+
     try:
         claude_markdown, stats = summarize(
             new_items,
-            defillama_text=defillama_text,
+            defillama_text=combined_data_text,
             recent_briefs=recent_briefs,
         )
         log(
@@ -1852,7 +2277,11 @@ def main() -> int:
             log(f"  prepended yesterday's journal ({len(yesterday_summary)} chars)")
 
     html = render_brief_html(
-        claude_markdown, new_items, stats, defillama_snapshot=defillama_snapshot
+        claude_markdown,
+        new_items,
+        stats,
+        defillama_snapshot=defillama_snapshot,
+        mev_snapshot=mev_snapshot,
     )
     archive_path = write_brief_to_disk(
         html, stats, len(new_items), raw_markdown=claude_markdown
