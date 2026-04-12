@@ -989,25 +989,75 @@ def summarize(
     ]
     log(f"  invoking: {' '.join(cmd)}")
 
-    # Use the watchdog helper — guarantees we either get output or an error
-    # within CLAUDE_CLI_TIMEOUT seconds, never hangs forever.
-    result = _run_claude_with_watchdog(cmd, prompt, CLAUDE_CLI_TIMEOUT)
+    # Retry cascade: attempt with WebSearch first (the valuable path),
+    # fall back to no-tools if it hangs (the reliable path). Most runs
+    # succeed on attempt 1. Failed runs degrade gracefully instead of
+    # producing nothing — which is what the user actually needs.
+    ATTEMPT_1_TIMEOUT = min(CLAUDE_CLI_TIMEOUT, 600)  # 10 min with tools
+    ATTEMPT_2_TIMEOUT = 300                            # 5 min without tools
 
-    duration = (datetime.now() - start).total_seconds()
+    for attempt, (use_tools, timeout) in enumerate([
+        (True, ATTEMPT_1_TIMEOUT),
+        (False, ATTEMPT_2_TIMEOUT),
+    ], 1):
+        attempt_cmd = list(cmd)
+        if not use_tools:
+            # Replace the tools arg with empty
+            try:
+                idx = attempt_cmd.index("WebSearch,WebFetch")
+                attempt_cmd[idx] = ""
+            except ValueError:
+                pass
+            log(f"  attempt {attempt}: retrying WITHOUT WebSearch ({timeout}s timeout)")
+        else:
+            log(f"  attempt {attempt}: with WebSearch ({timeout}s timeout)")
 
-    if result.returncode != 0:
-        err = (result.stderr or "").strip()[:800]
-        raise RuntimeError(
-            f"claude -p exited {result.returncode}: {err or '<no stderr>'}"
-        )
+        try:
+            result = _run_claude_with_watchdog(attempt_cmd, prompt, timeout)
+        except RuntimeError as e:
+            if attempt == 1:
+                log(f"  attempt 1 failed: {e}")
+                notify_macos(
+                    title="Brief degraded",
+                    subtitle="WebSearch timed out — retrying without",
+                    message="Next attempt uses pre-fetched context only",
+                )
+                continue  # try attempt 2
+            else:
+                raise  # both attempts failed
 
-    output = _strip_preamble(result.stdout.strip())
-    stats = {
-        "duration_seconds": round(duration, 1),
-        "output_chars": len(output),
-        "stderr_chars": len(result.stderr or ""),
-    }
-    return output, stats
+        duration = (datetime.now() - start).total_seconds()
+
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()[:800]
+            if attempt == 1:
+                log(f"  attempt 1 exited {result.returncode}: {err[:200]}")
+                continue  # try attempt 2
+            raise RuntimeError(
+                f"claude -p exited {result.returncode}: {err or '<no stderr>'}"
+            )
+
+        output = _strip_preamble(result.stdout.strip())
+        if not output or len(output) < 100:
+            if attempt == 1:
+                log(f"  attempt 1 produced empty/tiny output ({len(output)} chars)")
+                continue
+            # Even attempt 2 is empty — still return what we have
+
+        if attempt == 2:
+            log("  completed on attempt 2 (no WebSearch — degraded quality)")
+
+        stats = {
+            "duration_seconds": round(duration, 1),
+            "output_chars": len(output),
+            "stderr_chars": len(result.stderr or ""),
+            "attempt": attempt,
+            "used_web_search": use_tools,
+        }
+        return output, stats
+
+    # Should never reach here, but just in case
+    raise RuntimeError("both attempts failed")
 
 
 # --- HTML brief rendering ---------------------------------------------------
@@ -1454,8 +1504,8 @@ def load_recent_brief_context() -> str:
             continue
         # Trim to save tokens — we care about what topics were covered,
         # not every link
-        if len(content) > 12000:
-            content = content[:12000] + "\n\n[...truncated]"
+        if len(content) > 6000:
+            content = content[:6000] + "\n\n[...truncated]"
         blocks.append(f"### Brief from {label}\n\n{content}")
     if not blocks:
         return ""
@@ -2049,12 +2099,15 @@ def send_telegram_brief(
     summary = build_telegram_summary(
         claude_markdown, item_count, len(FEEDS), defillama_snapshot
     )
+    # Use plain text instead of Markdown for the summary — Telegram's
+    # Markdown parser is strict and Claude's output often contains
+    # unmatched asterisks, brackets, or other chars that break it.
+    # Plain text is reliable and readable.
     resp = _telegram_post(
         token, "sendMessage",
         data={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": summary,
-            "parse_mode": "Markdown",
+            "text": summary.replace("*", "").replace("_", ""),
             "disable_web_page_preview": "true",
         },
     )
