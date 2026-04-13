@@ -621,7 +621,12 @@ def expand_links_for_items(items: list[dict]) -> None:
 
 # --- summarization ----------------------------------------------------------
 
-def build_prompt(items: list[dict], defillama_text: str = "", recent_briefs: str = "") -> str:
+def build_prompt(
+    items: list[dict],
+    defillama_text: str = "",
+    recent_briefs: str = "",
+    tools_available: bool = True,
+) -> str:
     # Group items by category in the prompt so Claude sees source context
     items_by_cat: dict[str, list[dict]] = {}
     for it in items:
@@ -717,6 +722,29 @@ The Hacker News input category contains the current HN frontpage (top stories by
     exclusions_block = "\n".join(f"- {e}" for e in EXCLUSIONS)
     first_section = MANDATORY_SECTIONS[0] if MANDATORY_SECTIONS else "Ethereum"
 
+    if tools_available:
+        search_instructions = f"""## Use WebSearch and WebFetch to find the real stories
+
+You have WebSearch and WebFetch tools. Most tweets are truncated retweets without links — search to find the actual source. **Use approximately {WEB_SEARCH_BUDGET_HINT} searches for a full-size batch**, more for large batches. There is no per-search fee.
+
+Search WHEN:
+- A tweet / forum post / HN title references a launch, vote, hack, fundraise, partnership, release, paper, or data point without a link → find the underlying source
+- Multiple items reference the same event → ONE search, consolidate
+- An unfamiliar project or term needs a sentence of context → quick search
+- A stat is claimed without a source → verify and link the data source
+
+Do NOT search for:
+- Memes, banter, vibes, reactions with no specific claim
+- Anything already covered by a LINKED ARTICLE or sufficient show notes / release description
+- HN stories where the title + description already give you enough context"""
+    else:
+        search_instructions = """## IMPORTANT: No web search tools available this run
+
+Web search timed out on the primary attempt. You are running WITHOUT WebSearch or WebFetch.
+Work EXCLUSIVELY from the source material, linked article excerpts, and DeFi/MEV data provided below.
+Do NOT request tools, do NOT ask for permissions, do NOT mention that tools are unavailable.
+Write your brief as normal using what you have. If you can't verify a claim, use the tweet URL as the source link."""
+
     # Topic-level dedup block — only included when we have recent briefs
     if recent_briefs:
         recent_briefs_block = f"""## CRITICAL: Avoid repeating topics from recent briefs
@@ -763,20 +791,7 @@ You are being given material from SEVEN kinds of sources, clearly labelled in th
 - Only break out an individual item as its own bullet if it's original and substantive — a novel analysis, announcement, release, or research result with concrete content.
 - Scale volume to substance: a quiet window gets a short digest. Don't pad.
 
-## Use WebSearch and WebFetch to find the real stories
-
-You have WebSearch and WebFetch tools. Most tweets are truncated retweets without links — search to find the actual source. **Use approximately {WEB_SEARCH_BUDGET_HINT} searches for a full-size batch**, more for large batches. There is no per-search fee.
-
-Search WHEN:
-- A tweet / forum post / HN title references a launch, vote, hack, fundraise, partnership, release, paper, or data point without a link → find the underlying source
-- Multiple items reference the same event → ONE search, consolidate
-- An unfamiliar project or term needs a sentence of context → quick search
-- A stat is claimed without a source → verify and link the data source
-
-Do NOT search for:
-- Memes, banter, vibes, reactions with no specific claim
-- Anything already covered by a LINKED ARTICLE or sufficient show notes / release description
-- HN stories where the title + description already give you enough context (search only for the ones that genuinely need it)
+{search_instructions}
 
 ## Mandatory section structure
 
@@ -974,12 +989,17 @@ def summarize(
     and a block of recent briefs so the model actively avoids repeating
     stories already covered in the last 48 hours.
     """
-    prompt = build_prompt(
-        items, defillama_text=defillama_text, recent_briefs=recent_briefs
+    prompt_with_tools = build_prompt(
+        items, defillama_text=defillama_text, recent_briefs=recent_briefs,
+        tools_available=True,
+    )
+    prompt_without_tools = build_prompt(
+        items, defillama_text=defillama_text, recent_briefs=recent_briefs,
+        tools_available=False,
     )
 
     # Persist the prompt for debugging / reproducibility
-    (HOME / "last-prompt.md").write_text(prompt)
+    (HOME / "last-prompt.md").write_text(prompt_with_tools)
 
     start = datetime.now()
     cmd = [
@@ -1012,8 +1032,9 @@ def summarize(
         else:
             log(f"  attempt {attempt}: with WebSearch ({timeout}s timeout)")
 
+        attempt_prompt = prompt_with_tools if use_tools else prompt_without_tools
         try:
-            result = _run_claude_with_watchdog(attempt_cmd, prompt, timeout)
+            result = _run_claude_with_watchdog(attempt_cmd, attempt_prompt, timeout)
         except RuntimeError as e:
             if attempt == 1:
                 log(f"  attempt 1 failed: {e}")
