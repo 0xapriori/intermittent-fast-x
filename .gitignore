@@ -33,3 +33,6 @@ env/
 
 # Generated plists installed from template (users edit a local copy)
 *.plist.installed
+
+# Post-synthesis topic dedup state (personal)
+recent-topics.md

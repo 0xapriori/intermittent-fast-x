@@ -35,6 +35,7 @@ import trafilatura
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "state.json"
+TOPICS_FILE = BASE_DIR / "recent-topics.md"
 LOG_DIR = BASE_DIR / "logs"
 
 
@@ -107,6 +108,15 @@ WEB_SEARCH_BUDGET_HINT: int = CONFIG.get("web_search_budget_hint", 10)
 # individual items but stories span multiple tweets/posts over days.
 RECENT_BRIEFS_COUNT: int = CONFIG.get("recent_briefs_for_dedup", 3)
 RECENT_BRIEFS_HOURS: int = CONFIG.get("recent_briefs_hours", 48)
+
+# Post-synthesis topic filter: a second short `claude -p` pass marks each
+# bullet KEEP / COLLAPSE / DROP against recent-topics.md so the draft doesn't
+# reship stories already covered in recent briefs. GUID dedup handles items;
+# this handles topic-level rehash (same story, fresh tweets).
+TOPIC_COOLDOWN_HOURS: int = CONFIG.get("topic_cooldown_hours", 72)
+TOPIC_FILTER_MODEL: str = CONFIG.get("topic_filter_model", "claude-sonnet-4-6")
+TOPIC_FILTER_TIMEOUT_SECONDS: int = CONFIG.get("topic_filter_timeout_seconds", 300)
+TOPIC_FILTER_ENABLED: bool = bool(CONFIG.get("topic_filter_enabled", True))
 
 # Telegram delivery (opt-in, config.output.telegram.enabled)
 _telegram_cfg = _output_cfg.get("telegram", {}) if isinstance(_output_cfg, dict) else {}
@@ -1533,6 +1543,381 @@ def load_recent_brief_context() -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+# --- post-synthesis topic filter -------------------------------------------
+
+_BULLET_HEADLINE_RE = re.compile(r"^\s*-\s+\*\*(.+?)\*\*")
+_TOPICS_SECTION_RE = re.compile(
+    r"^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — (.+)$", re.MULTILINE
+)
+_TOPICS_HEADER = (
+    "# Recent topics covered in briefs\n\n"
+    "_Auto-managed by digest.py. Entries older than the cooldown "
+    "are pruned on the next run. Hand-edit to force a topic to age "
+    "out early or to block it from recurring._\n"
+)
+
+
+def _normalize_headline(s: str) -> str:
+    return " ".join(s.strip().lower().split())
+
+
+def extract_bullet_blocks(markdown: str) -> list[dict]:
+    """Parse a brief-style markdown into bullet blocks.
+
+    Returns a list of dicts, one per `- **Headline**: ...` bullet:
+        {
+          "headline": str,           # text between the first ** .. **
+          "start": int,              # line index where the bullet begins
+          "end": int,                # exclusive line index where it ends
+          "lines": list[str],        # the raw lines (incl. continuations)
+        }
+
+    Non-bullet lines (section headers, paragraphs, blank lines) are not
+    returned — callers rebuild the file by splicing bullets back into the
+    original line list by index.
+    """
+    lines = markdown.split("\n")
+    blocks: list[dict] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _BULLET_HEADLINE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        headline = m.group(1).strip()
+        start = i
+        j = i + 1
+        # Continuation: indented lines, blank lines, or non-top-level content
+        # that belongs to this bullet. Stop at next `- ` at column 0 or any
+        # `## ` header at column 0.
+        while j < n:
+            nxt = lines[j]
+            if nxt.startswith("## ") or nxt.startswith("# "):
+                break
+            if nxt.startswith("- "):
+                break
+            j += 1
+        # Trim trailing blank lines off the block (keep one for spacing when
+        # rebuilding)
+        end = j
+        while end > start + 1 and lines[end - 1].strip() == "":
+            end -= 1
+        blocks.append(
+            {
+                "headline": headline,
+                "start": start,
+                "end": end,
+                "lines": lines[start:end],
+            }
+        )
+        i = j
+    return blocks
+
+
+def load_recent_topics_for_filter() -> tuple[list[dict], str]:
+    """Read recent-topics.md, prune expired sections, return (topics, rewritten).
+
+    `topics` is a list of {"headline": str, "timestamp": datetime,
+    "brief": str} with entries inside the cooldown window.
+    `rewritten` is the pruned file contents (caller writes it back).
+    Returns ([], header) if the file doesn't exist or is empty.
+    """
+    if not TOPICS_FILE.exists():
+        return [], _TOPICS_HEADER
+    try:
+        raw = TOPICS_FILE.read_text()
+    except OSError:
+        return [], _TOPICS_HEADER
+
+    cutoff = datetime.now() - timedelta(hours=TOPIC_COOLDOWN_HOURS)
+
+    # Split into sections by `## <ts> — <brief>` headers. Preserve the file's
+    # header preamble (everything before the first `## ` with a date).
+    section_starts: list[tuple[int, str, str]] = []
+    for m in _TOPICS_SECTION_RE.finditer(raw):
+        section_starts.append((m.start(), m.group(1), m.group(2)))
+
+    if not section_starts:
+        # No dated sections yet — just ensure the canonical header exists
+        return [], _TOPICS_HEADER
+
+    preamble = raw[: section_starts[0][0]]
+    if not preamble.strip():
+        preamble = _TOPICS_HEADER
+
+    kept_topics: list[dict] = []
+    kept_sections: list[str] = []
+    for idx, (offset, ts_str, brief_label) in enumerate(section_starts):
+        try:
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        end = (
+            section_starts[idx + 1][0]
+            if idx + 1 < len(section_starts)
+            else len(raw)
+        )
+        section_text = raw[offset:end].rstrip() + "\n"
+        kept_sections.append(section_text)
+        for line in section_text.split("\n"):
+            stripped = line.lstrip("-* ").strip()
+            if not stripped or line.startswith("#"):
+                continue
+            if line.lstrip().startswith(("-", "*")):
+                kept_topics.append(
+                    {
+                        "headline": stripped,
+                        "timestamp": ts,
+                        "brief": brief_label,
+                    }
+                )
+
+    rewritten = preamble.rstrip() + "\n\n" + "\n".join(kept_sections)
+    return kept_topics, rewritten
+
+
+def save_recent_topics(
+    final_markdown: str, brief_label: str, run_ts: datetime
+) -> None:
+    """Append this run's headlines to recent-topics.md, pruning expired.
+
+    Writes atomically via a .tmp rename. Never raises — failure is logged
+    and the brief is already on disk, so topic tracking is best-effort.
+    """
+    try:
+        topics, rewritten = load_recent_topics_for_filter()
+        blocks = extract_bullet_blocks(final_markdown)
+        headlines = [b["headline"] for b in blocks]
+        if not headlines:
+            log("  topics: no bullet headlines extracted — not appending")
+            # Still write the prune-rewritten file so old entries age out
+            _atomic_write_text(TOPICS_FILE, rewritten)
+            return
+        new_section = (
+            f"## {run_ts.strftime('%Y-%m-%d %H:%M')} — {brief_label}\n"
+            + "\n".join(f"- {h}" for h in headlines)
+            + "\n"
+        )
+        body = rewritten.rstrip() + "\n\n" + new_section
+        _atomic_write_text(TOPICS_FILE, body)
+        log(
+            f"  topics: appended {len(headlines)} headlines "
+            f"({len(topics)} prior still within cooldown)"
+        )
+    except Exception as e:
+        log(f"  topics: save failed ({type(e).__name__}: {e}) — non-fatal")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _build_filter_prompt(draft: str, recent_topics: list[dict]) -> str:
+    if recent_topics:
+        lines = []
+        for t in sorted(recent_topics, key=lambda x: x["timestamp"], reverse=True):
+            lines.append(
+                f"[{t['timestamp'].strftime('%Y-%m-%d %H:%M')}] {t['headline']}"
+            )
+        topic_block = "\n".join(lines)
+    else:
+        topic_block = "(no prior topics within cooldown window)"
+
+    return f"""You are filtering a research brief draft for staleness.
+
+The reader has ALREADY read every item in "Recently covered" below within the last {TOPIC_COOLDOWN_HOURS} hours. Your job: for each bullet in the draft with a **bold headline**, decide whether to keep it, collapse it to one line, or drop it.
+
+Decision rules:
+- **KEEP**: genuinely new story, OR a covered story with materially new facts (new data, concrete next step, resolution, contradiction, named participant change).
+- **COLLAPSE**: incremental update on a covered story — rewrite as ONE short sentence starting with "Still developing:". Example: "Still developing: Arbitrum Security Council final voting round is now live; no result yet."
+- **DROP**: pure rehash, no new information beyond what was already covered.
+
+When comparing, match on the underlying STORY, not on the exact words — fresh podcasts/tweets covering an already-covered story are rehash, not new signal. Be willing to drop bullets the draft spent effort on; the reader wants signal, not padding.
+
+<recently_covered>
+{topic_block}
+</recently_covered>
+
+<draft>
+{draft}
+</draft>
+
+Output VALID JSON ONLY — no preamble, no code fences, no commentary. Copy each headline EXACTLY as it appears between ** ** in the draft.
+
+{{"decisions":[
+  {{"headline":"<exact bold headline text>","action":"KEEP","collapsed":""}},
+  {{"headline":"<...>","action":"COLLAPSE","collapsed":"Still developing: <one short sentence>"}},
+  {{"headline":"<...>","action":"DROP","collapsed":""}}
+]}}
+"""
+
+
+def _parse_filter_json(raw: str) -> dict | None:
+    """Parse the filter pass output. Tolerates a stray code fence or prose
+    leading/trailing the JSON; returns None if no valid JSON found."""
+    s = raw.strip()
+    # Strip common code-fence wrappers
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+    # Find the outermost {...}
+    start = s.find("{")
+    end = s.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(s[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def filter_stale_bullets(
+    draft: str, recent_topics: list[dict]
+) -> tuple[str, dict]:
+    """Second-pass `claude -p` filter.
+
+    Returns (filtered_markdown, stats). On any failure (timeout, bad JSON,
+    empty response, all-drop result), returns the input draft unchanged
+    with stats["ok"]=False and a reason.
+    """
+    stats = {"ok": False, "reason": "not-run", "kept": 0, "collapsed": 0, "dropped": 0}
+    blocks = extract_bullet_blocks(draft)
+    if not blocks:
+        stats["reason"] = "no-bullets"
+        return draft, stats
+
+    prompt = _build_filter_prompt(draft, recent_topics)
+    cmd = ["claude", "-p", "--model", TOPIC_FILTER_MODEL]
+    log(
+        f"  filter: {len(blocks)} bullets, {len(recent_topics)} prior topics, "
+        f"model={TOPIC_FILTER_MODEL}"
+    )
+    try:
+        result = _run_claude_with_watchdog(
+            cmd, prompt, TOPIC_FILTER_TIMEOUT_SECONDS
+        )
+    except RuntimeError as e:
+        stats["reason"] = f"watchdog: {e}"
+        log(f"  filter: {stats['reason']} — shipping unfiltered")
+        return draft, stats
+
+    if result.returncode != 0:
+        stats["reason"] = f"exit-{result.returncode}"
+        log(f"  filter: claude exited {result.returncode} — shipping unfiltered")
+        return draft, stats
+
+    parsed = _parse_filter_json(result.stdout)
+    if not parsed or "decisions" not in parsed:
+        stats["reason"] = "bad-json"
+        log("  filter: unparseable JSON — shipping unfiltered")
+        return draft, stats
+
+    # Build a decision map keyed by normalized headline
+    decisions: dict[str, dict] = {}
+    for d in parsed.get("decisions", []):
+        h = d.get("headline", "")
+        if not h:
+            continue
+        decisions[_normalize_headline(h)] = d
+
+    # Apply decisions. Drop entries that would leave ALL bullets dropped
+    # (safety check — something's wrong with the filter).
+    lines = draft.split("\n")
+    drop_spans: list[tuple[int, int]] = []
+    replace_spans: list[tuple[int, int, str]] = []
+    kept = collapsed_n = dropped = 0
+    for b in blocks:
+        key = _normalize_headline(b["headline"])
+        d = decisions.get(key)
+        if not d:
+            kept += 1
+            continue
+        action = (d.get("action") or "KEEP").upper()
+        if action == "DROP":
+            drop_spans.append((b["start"], b["end"]))
+            dropped += 1
+        elif action == "COLLAPSE":
+            collapsed_line = (d.get("collapsed") or "").strip()
+            if not collapsed_line:
+                kept += 1
+                continue
+            if not collapsed_line.startswith("- "):
+                collapsed_line = f"- {collapsed_line}"
+            replace_spans.append((b["start"], b["end"], collapsed_line))
+            collapsed_n += 1
+        else:
+            kept += 1
+
+    if kept == 0 and (dropped + collapsed_n) > 0:
+        stats["reason"] = "all-dropped-safety-skip"
+        log("  filter: would drop ALL bullets — skipping filter, shipping unfiltered")
+        return draft, stats
+
+    # Apply mutations from bottom up so indices stay valid
+    mutations = (
+        [("drop", s, e, None) for s, e in drop_spans]
+        + [("replace", s, e, text) for s, e, text in replace_spans]
+    )
+    mutations.sort(key=lambda m: m[1], reverse=True)
+    for kind, s, e, text in mutations:
+        if kind == "drop":
+            del lines[s:e]
+        else:
+            lines[s:e] = [text]
+
+    filtered = "\n".join(lines)
+    # Collapse 3+ consecutive blank lines left behind by drops
+    filtered = re.sub(r"\n{3,}", "\n\n", filtered)
+    # Drop sections whose only remaining content is the header + blank lines
+    filtered = _drop_empty_sections(filtered)
+
+    stats.update(
+        {"ok": True, "reason": "ok", "kept": kept,
+         "collapsed": collapsed_n, "dropped": dropped}
+    )
+    log(
+        f"  filter: kept={kept} collapsed={collapsed_n} dropped={dropped}"
+    )
+    return filtered, stats
+
+
+def _drop_empty_sections(markdown: str) -> str:
+    """Remove `## Heading` blocks that contain no non-blank content before
+    the next header or EOF. Keeps the very first line if it's not a header."""
+    lines = markdown.split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if line.startswith("## "):
+            # Look ahead until next header or EOF
+            j = i + 1
+            has_content = False
+            while j < n and not lines[j].startswith("## "):
+                if lines[j].strip():
+                    has_content = True
+                    break
+                j += 1
+            if has_content:
+                out.append(line)
+                i += 1
+            else:
+                # Skip this header entirely; jump to next header position
+                while j < n and not lines[j].startswith("## "):
+                    j += 1
+                i = j
+        else:
+            out.append(line)
+            i += 1
+    return "\n".join(out)
+
+
 # --- DefiLlama snapshot -----------------------------------------------------
 
 DEFILLAMA_TIMEOUT = 15  # seconds per endpoint
@@ -2327,6 +2712,26 @@ def main() -> int:
     if key_tweet_urls:
         log(f"extracted {len(key_tweet_urls)} key tweet URLs for Telegram")
 
+    # Post-synthesis topic filter: compact second pass against recent-topics.md
+    # marks each bullet KEEP / COLLAPSE / DROP. The compact prompt (draft +
+    # headline list only) lets the instruction actually bind — unlike at the
+    # tail of a 100KB synthesis prompt. Safe by default: any failure falls
+    # through to shipping the unfiltered draft.
+    filter_stats = {"ok": False, "reason": "disabled"}
+    if TOPIC_FILTER_ENABLED:
+        recent_topics, _pruned = load_recent_topics_for_filter()
+        filtered_markdown, filter_stats = filter_stale_bullets(
+            claude_markdown, recent_topics
+        )
+        if filter_stats.get("ok"):
+            claude_markdown = filtered_markdown
+    stats["filter"] = filter_stats
+
+    # Capture the brief's topic-bearing markdown BEFORE journal prepend, so
+    # the project notes that get stitched on for morning runs don't pollute
+    # recent-topics.md with non-news entries.
+    topics_source_markdown = claude_markdown
+
     # Morning run prepends yesterday's Claude Code journal summary.
     # "Morning" = any run fired between 5am and noon local time. This covers
     # both the on-schedule 7am run AND late-fire cases where the Mac was
@@ -2402,6 +2807,16 @@ def main() -> int:
     state["seen_ids"].extend(it["id"] for it in new_items)
     save_state(state)
     log(f"state updated — now tracking {len(state['seen_ids'])} ids")
+
+    # Persist this run's final headlines to recent-topics.md for the next
+    # run's filter pass. Use the *post-filter* markdown so COLLAPSE/DROP
+    # decisions don't reappear as "already covered" next time.
+    try:
+        brief_label = f"briefs/{archive_path.name}"
+        save_recent_topics(topics_source_markdown, brief_label, datetime.now())
+    except Exception as e:
+        log(f"  topics: unexpected error ({type(e).__name__}: {e})")
+
     log("digest run end")
     return 0
 
