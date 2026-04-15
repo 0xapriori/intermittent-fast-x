@@ -1023,8 +1023,11 @@ def summarize(
     # fall back to no-tools if it hangs (the reliable path). Most runs
     # succeed on attempt 1. Failed runs degrade gracefully instead of
     # producing nothing — which is what the user actually needs.
-    ATTEMPT_1_TIMEOUT = min(CLAUDE_CLI_TIMEOUT, 600)  # 10 min with tools
-    ATTEMPT_2_TIMEOUT = 300                            # 5 min without tools
+    # Bumped from 600/300: two consecutive morning runs failed when the Mac
+    # woke late and claude -p hit a stale-network hang inside the old window.
+    # 900s gives a cushion for post-wake network warmup before the retry.
+    ATTEMPT_1_TIMEOUT = min(CLAUDE_CLI_TIMEOUT, 900)  # 15 min with tools
+    ATTEMPT_2_TIMEOUT = 450                            # 7.5 min without tools
 
     for attempt, (use_tools, timeout) in enumerate([
         (True, ATTEMPT_1_TIMEOUT),
