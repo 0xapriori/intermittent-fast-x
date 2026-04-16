@@ -985,6 +985,39 @@ def _run_claude_with_watchdog(cmd: list[str], prompt: str, timeout_s: int) -> su
         __import__("time").sleep(poll_interval)
 
 
+def _warmup_claude_session() -> bool:
+    """Ping `claude -p` with a trivial prompt before the heavy synthesis.
+
+    Three consecutive morning runs (2026-04-14/15/16) hung on `claude -p`
+    inside both watchdog windows, while the same invocation works fine
+    minutes later from an interactive shell. The only thing special about
+    the morning context is the Mac woke from sleep shortly before. The
+    working theory: the first post-wake `claude -p` call hangs on a stale
+    OAuth/session state that a short ping forces to re-establish.
+
+    We retry with increasing budgets (30/60/120s). On success the main
+    synthesis is cheap — the session is warm. On total failure we log and
+    proceed anyway; the main call's own watchdogs still protect against
+    the worst case.
+    """
+    budgets = [30, 60, 120]
+    cmd = ["claude", "-p", "--model", MODEL]
+    for i, timeout in enumerate(budgets, 1):
+        log(f"  warmup attempt {i}/{len(budgets)} ({timeout}s budget)")
+        try:
+            result = _run_claude_with_watchdog(cmd, "Respond with OK.", timeout)
+        except RuntimeError as e:
+            log(f"  warmup attempt {i} hung: {e}")
+            continue
+        if result.returncode == 0 and (result.stdout or "").strip():
+            log("  warmup: session live")
+            return True
+        log(f"  warmup attempt {i}: rc={result.returncode} "
+            f"stderr={(result.stderr or '').strip()[:120]!r}")
+    log("  warmup: all attempts failed — proceeding with main synthesis anyway")
+    return False
+
+
 def summarize(
     items: list[dict],
     defillama_text: str = "",
@@ -999,6 +1032,7 @@ def summarize(
     and a block of recent briefs so the model actively avoids repeating
     stories already covered in the last 48 hours.
     """
+    _warmup_claude_session()
     prompt_with_tools = build_prompt(
         items, defillama_text=defillama_text, recent_briefs=recent_briefs,
         tools_available=True,
