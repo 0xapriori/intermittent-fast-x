@@ -2480,7 +2480,10 @@ def build_telegram_summary(
     lines.append("")
 
     # Extract first bullet from each `## Section`
-    sections = re.split(r"\n## ", claude_markdown)
+    # Prepend \n so the split catches a leading `## Ethereum` at the start
+    # of the markdown — without this, the first section lands in the
+    # "preamble" slot and gets skipped (the persistent missing-Ethereum bug).
+    sections = re.split(r"\n## ", "\n" + claude_markdown)
     for s in sections[1:]:  # skip preamble
         header, _, rest = s.partition("\n")
         header = header.strip()
@@ -2769,28 +2772,9 @@ def main() -> int:
     # recent-topics.md with non-news entries.
     topics_source_markdown = claude_markdown
 
-    # Morning run prepends yesterday's Claude Code journal summary.
-    # "Morning" = any run fired between 5am and noon local time. This covers
-    # both the on-schedule 7am run AND late-fire cases where the Mac was
-    # asleep at 7am and launchd finally fired at e.g. 9am when you opened
-    # the lid. Only the first morning run of the day includes the prepend
-    # (we don't want the 2pm run to also prepend).
-    # Set FORCE_MORNING_PREPEND=1 to force it outside this window.
-    now_hour = datetime.now().hour
-    is_morning_run = (
-        (5 <= now_hour < 12)
-        or os.environ.get("FORCE_MORNING_PREPEND", "").lower() in ("1", "true", "yes")
-    )
-    if is_morning_run:
-        log("morning run: looking for yesterday's journal")
-        yesterday_summary = load_yesterdays_journal()
-        if yesterday_summary:
-            claude_markdown = (
-                yesterday_summary.strip()
-                + "\n\n---\n\n"
-                + claude_markdown.strip()
-            )
-            log(f"  prepended yesterday's journal ({len(yesterday_summary)} chars)")
+    # Journal prepend removed — user found the previous-day Claude Code
+    # session summaries were often incomplete or inaccurate, and preferred
+    # to drop them entirely rather than ship unreliable info.
 
     html = render_brief_html(
         claude_markdown,
